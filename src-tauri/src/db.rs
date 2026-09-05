@@ -438,7 +438,7 @@ pub fn query_model_stats(path: &Path, filters: MetricFilters) -> AppResult<Vec<M
             }
         })
         .collect::<Vec<_>>();
-    result.sort_by(|a, b| b.tokens.total.cmp(&a.tokens.total));
+    result.sort_by_key(|row| std::cmp::Reverse(row.tokens.total));
     Ok(result)
 }
 
