@@ -1,0 +1,36 @@
+[package]
+name = "agent-meter"
+version = "0.1.0"
+description = "Local Codex usage and performance monitor"
+authors = ["LeoY"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/leoyoul/agent-meter"
+homepage = "https://github.com/leoyoul/agent-meter"
+
+[lib]
+name = "agent_meter_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "agent-meter"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+notify = "8"
+parking_lot = "0.12"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = ["macos-private-api", "tray-icon"] }
+tauri-plugin-autostart = "2"
+thiserror = "2"
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"
