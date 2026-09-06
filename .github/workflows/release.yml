@@ -48,6 +48,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cd src-tauri/target/aarch64-apple-darwin/release/bundle/dmg
-          shasum -a 256 *.dmg > "$GITHUB_WORKSPACE/SHA256SUMS.txt"
+          shasum -a 256 *.dmg | sed 's/  Agent Meter/  Agent.Meter/' > "$GITHUB_WORKSPACE/SHA256SUMS.txt"
           cd "$GITHUB_WORKSPACE"
           gh release upload "$GITHUB_REF_NAME" SHA256SUMS.txt --clobber
