@@ -41,7 +41,7 @@ jobs:
             本版本提供 Apple Silicon DMG 和应用内更新包。DMG 尚未经过 Apple Developer ID 签名或 Apple 公证。
           releaseDraft: false
           prerelease: false
-          uploadUpdaterJson: true
+          includeUpdaterJson: true
           args: --target aarch64-apple-darwin
       - name: Upload DMG checksum
         env:
