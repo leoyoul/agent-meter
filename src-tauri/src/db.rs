@@ -173,20 +173,29 @@ fn known_source_paths() -> Vec<(String, PathBuf, &'static str)> {
             home.join(".local/share/opencode/opencode.db"),
             "opencode_sqlite",
         ),
+        ("DSH".into(), home.join(".dsh/sessions"), "dsh_zstd"),
+        (
+            "Claude".into(),
+            home.join("Library/Application Support/Claude"),
+            "claude_desktop",
+        ),
+        (
+            "EvoX".into(),
+            home.join(".evox/agent/observability"),
+            "evox_observability",
+        ),
     ]
 }
 
 pub fn sync_known_sources(conn: &Connection) -> AppResult<()> {
     for (name, path, source_kind) in known_source_paths() {
-        if path.exists() {
-            conn.execute(
-                "INSERT INTO sources(name, root_path, source_kind, enabled)
+        conn.execute(
+            "INSERT INTO sources(name, root_path, source_kind, enabled)
                  VALUES (?1, ?2, ?3, 1)
                  ON CONFLICT(root_path) DO UPDATE SET name=excluded.name,source_kind=excluded.source_kind",
-                params![name, path.to_string_lossy(), source_kind],
-            )
-            .map_err(to_error)?;
-        }
+            params![name, path.to_string_lossy(), source_kind],
+        )
+        .map_err(to_error)?;
     }
     Ok(())
 }
@@ -218,13 +227,20 @@ pub fn discover_sources(path: &Path) -> AppResult<Vec<SourceInfo>> {
         let (id, name, root_path, source_kind, enabled, last_scan_at, error) =
             row.map_err(to_error)?;
         let source_path = Path::new(&root_path);
-        let available = if source_kind == "codex_jsonl" {
+        let available = if matches!(
+            source_kind.as_str(),
+            "codex_jsonl" | "dsh_zstd" | "claude_desktop" | "evox_observability"
+        ) {
             source_path.is_dir()
         } else {
             source_path.is_file()
         };
         let (file_count, total_bytes) = if source_kind == "codex_jsonl" {
             source_inventory(source_path)
+        } else if source_kind == "dsh_zstd" {
+            extension_inventory(source_path, "zstd")
+        } else if source_kind == "evox_observability" {
+            extension_inventory(source_path, "jsonl")
         } else if let Ok(metadata) = source_path.metadata() {
             (1, metadata.len())
         } else {
@@ -233,6 +249,7 @@ pub fn discover_sources(path: &Path) -> AppResult<Vec<SourceInfo>> {
         result.push(SourceInfo {
             id,
             name,
+            source_kind: source_kind.clone(),
             root_path,
             enabled,
             available,
@@ -240,9 +257,39 @@ pub fn discover_sources(path: &Path) -> AppResult<Vec<SourceInfo>> {
             total_bytes,
             last_scan_at,
             error,
+            data_capability: if source_kind == "claude_desktop" {
+                "noUsageLog".into()
+            } else {
+                "metrics".into()
+            },
+            limitation: if source_kind == "claude_desktop" {
+                Some("未发现可统计的本地 Token 记录".into())
+            } else {
+                None
+            },
         });
     }
     Ok(result)
+}
+
+fn extension_inventory(root: &Path, extension: &str) -> (u64, u64) {
+    if !root.is_dir() {
+        return (0, 0);
+    }
+    WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            entry.file_type().is_file()
+                && entry.path().extension().and_then(|value| value.to_str()) == Some(extension)
+        })
+        .fold((0_u64, 0_u64), |(count, bytes), entry| {
+            (
+                count + 1,
+                bytes.saturating_add(entry.metadata().map(|metadata| metadata.len()).unwrap_or(0)),
+            )
+        })
 }
 
 pub fn source_inventory(root: &Path) -> (u64, u64) {
@@ -299,6 +346,20 @@ pub fn update_source(path: &Path, source_id: i64, enabled: bool) -> AppResult<So
         .into_iter()
         .find(|source| source.id == source_id)
         .ok_or_else(|| format!("source {source_id} not found"))
+}
+
+pub fn source_scope(
+    path: &Path,
+    source_kind: &str,
+) -> AppResult<Option<(i64, String, bool, String)>> {
+    let conn = open(path)?;
+    conn.query_row(
+        "SELECT id,name,enabled,root_path FROM sources WHERE source_kind=?1 LIMIT 1",
+        [source_kind],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )
+    .optional()
+    .map_err(to_error)
 }
 
 #[derive(Debug, Clone)]
@@ -588,6 +649,7 @@ pub fn to_error(error: impl std::fmt::Display) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn percentile_uses_nearest_rank() {
@@ -601,5 +663,20 @@ mod tests {
         assert!(is_rollout(Path::new("rollout-2026-01.jsonl")));
         assert!(!is_rollout(Path::new("session_index.jsonl")));
         assert!(!is_rollout(Path::new("rollout-2026-01.json")));
+    }
+
+    #[test]
+    fn all_supported_sources_are_visible_even_when_unavailable() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("meter.sqlite3");
+        migrate(&path).unwrap();
+        let names = discover_sources(&path)
+            .unwrap()
+            .into_iter()
+            .map(|source| source.name)
+            .collect::<Vec<_>>();
+        for expected in ["Codex", "ZCode", "OpenCode", "DSH", "Claude", "EvoX"] {
+            assert!(names.contains(&expected.to_string()));
+        }
     }
 }

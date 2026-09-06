@@ -129,6 +129,7 @@ pub struct PricingCatalogStatus {
 pub struct SourceInfo {
     pub id: i64,
     pub name: String,
+    pub source_kind: String,
     pub root_path: String,
     pub enabled: bool,
     pub available: bool,
@@ -136,6 +137,8 @@ pub struct SourceInfo {
     pub total_bytes: u64,
     pub last_scan_at: Option<String>,
     pub error: Option<String>,
+    pub data_capability: String,
+    pub limitation: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

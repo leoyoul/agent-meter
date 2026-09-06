@@ -3,19 +3,21 @@
 [![CI](https://github.com/leoyoul/agent-meter/actions/workflows/ci.yml/badge.svg)](https://github.com/leoyoul/agent-meter/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-2ea44f.svg)](LICENSE)
 
-Agent Meter 是一个本地优先的 macOS 菜单栏应用，用“速、首、量、费”观察 Codex、ZCode 和 OpenCode 的本机模型调用。
+Agent Meter 是一个本地优先的 macOS 菜单栏应用，用“速、首、量、费”观察 Codex、ZCode、OpenCode、DSH 和 EvoX 的本机模型调用，并检测 Claude Desktop 的本地数据能力。
 
-> Agent Meter 是社区维护的非官方工具，与 OpenAI、ZCode 或 OpenCode 无隶属或背书关系。
+> Agent Meter 是社区维护的非官方工具，与 OpenAI、Anthropic 及所支持 Agent 的开发者无隶属或背书关系。
 
 ![Agent Meter dashboard](docs/dashboard.png)
 
 ## 功能
 
-- 菜单栏提供四个独立的 `38×22pt` 双行状态项，每项固定宽度并可单独开关；应用图标始终保留。
+- 菜单栏提供四个独立的 `38×22pt` 双行状态项，大数值在上、指标名在下，每项固定宽度并可单独开关；应用图标始终保留。
+- 仪表盘使用顶层来源标签；当前来源同步用于仪表盘和菜单栏，重启后保持选择。
+- 仪表盘和设置是标准 macOS 窗口，打开时出现在 Dock 与 `⌘Tab`，关闭后继续在菜单栏后台运行。
 - 实时、今日、本周、本月和本年五个统一统计周期。
 - 按来源、模型和推理强度查看有效 TPS、首响、Token 与 API 等价费用。
 - Token 使用互不重叠的非缓存输入、缓存读取、缓存写入和输出计量桶；推理 Token 是输出子集。
-- Codex 使用流式 JSONL 增量索引，ZCode 与 OpenCode 只读其 SQLite 数据库，不遍历整个应用目录。
+- Codex 使用流式 JSONL 增量索引，ZCode 与 OpenCode 只读其 SQLite 数据库；DSH 流式解压 JSONL zstd，EvoX 只读 observability JSONL。
 - 支持暂停、断点续扫、数据源启停、重建 Codex 索引、登录启动和应用内稳定版更新。
 
 ## 指标口径
@@ -43,8 +45,11 @@ Agent Meter 是一个本地优先的 macOS 菜单栏应用，用“速、首、�
 | Codex | `~/.codex/sessions`、`~/.codex/archived_sessions` | 文件偏移与监听 |
 | ZCode | `~/.zcode/cli/db/db.sqlite` 的 `model_usage` | 最近调用重叠同步 |
 | OpenCode | `~/.local/share/opencode/opencode.db` | `time_updated + id` 游标 |
+| DSH | `~/.dsh/sessions/**/*.jsonl.zstd` | 压缩文件大小与修改时间 |
+| Claude Desktop | `~/Library/Application Support/Claude` | 仅检测；未发现稳定的本地 Token 日志 |
+| EvoX | `~/.evox/agent/observability/*.jsonl` | 文件变化与稳定调用 ID 去重 |
 
-应用不会扫描 ZCode 的完整目录，也不会重新读取已经迁移到统一 observation 层的 Codex 历史。
+应用不会扫描 ZCode 的完整目录，也不会读取 Claude 的 IndexedDB、Cache、Cookies 或对话正文；已经迁移到统一 observation 层的 Codex 历史无需重新导入。
 
 ## 安装
 

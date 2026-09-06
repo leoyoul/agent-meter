@@ -5,8 +5,13 @@ use crate::models::{
 };
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, TimeZone, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
-use std::collections::BTreeMap;
+use serde::de::IgnoredAny;
+use serde::Deserialize;
+use std::collections::{BTreeMap, HashMap};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::Path;
+use walkdir::WalkDir;
 
 const CATALOG_VERSION: &str = "2026-09-06.1";
 const VERIFIED_AT: &str = "2026-09-06";
@@ -254,6 +259,8 @@ pub fn sync_all_sources(path: &Path) -> AppResult<()> {
         sync_codex_turns(&conn)?;
         sync_zcode(&conn)?;
         sync_opencode(&conn)?;
+        sync_dsh(&conn)?;
+        sync_evox(&conn)?;
         reprice_conn(&conn)
     })();
     if result.is_ok() {
@@ -552,6 +559,576 @@ fn sync_opencode(conn: &Connection) -> AppResult<()> {
          ON CONFLICT(source_id) DO UPDATE SET updated_ms=excluded.updated_ms,external_id=excluded.external_id",
         params![source_id, latest.0, latest.1],
     ).map_err(db::to_error)?;
+    Ok(())
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct DshUsage {
+    input_tokens: i64,
+    cache_read_tokens: i64,
+    cache_write_tokens: i64,
+    output_tokens: i64,
+    reasoning_tokens: i64,
+    total_tokens: i64,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct DshMessage {
+    id: Option<String>,
+    content: Option<IgnoredAny>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct DshChunk {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    text: Option<IgnoredAny>,
+    block: Option<IgnoredAny>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct DshData {
+    turn: Option<i64>,
+    step: Option<i64>,
+    model: Option<String>,
+    provider: Option<String>,
+    reasoning_effort: Option<String>,
+    usage: Option<DshUsage>,
+    message: Option<DshMessage>,
+    chunk: Option<DshChunk>,
+    header: Option<IgnoredAny>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct DshEvent {
+    id: Option<String>,
+    #[serde(rename = "type")]
+    kind: String,
+    time: Option<i64>,
+    data: Option<DshData>,
+}
+
+#[derive(Default)]
+struct DshStep {
+    turn: i64,
+    step: i64,
+    started: i64,
+    first: Option<i64>,
+    provider: String,
+    model: String,
+    effort: String,
+    message_id: Option<String>,
+    usage: Option<DshUsage>,
+}
+
+fn normalized_dsh_input(usage: &DshUsage) -> i64 {
+    let separated = usage
+        .input_tokens
+        .saturating_add(usage.cache_read_tokens)
+        .saturating_add(usage.cache_write_tokens)
+        .saturating_add(usage.output_tokens);
+    if usage.total_tokens >= separated {
+        usage.input_tokens.max(0)
+    } else {
+        (usage.input_tokens - usage.cache_read_tokens - usage.cache_write_tokens).max(0)
+    }
+}
+
+fn file_stamp(conn: &Connection, source_id: i64, path: &Path) -> AppResult<(bool, u64, i64)> {
+    let metadata = path.metadata().map_err(db::to_error)?;
+    let size = metadata.len();
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|value| value.as_millis() as i64)
+        .unwrap_or(0);
+    let unchanged = conn
+        .query_row(
+            "SELECT size=?2 AND mtime_ms=?3 FROM scan_files WHERE source_id=?1 AND path=?4",
+            params![source_id, size as i64, mtime, path.to_string_lossy()],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()
+        .map_err(db::to_error)?
+        .unwrap_or(false);
+    Ok((unchanged, size, mtime))
+}
+
+fn mark_file(
+    conn: &Connection,
+    source_id: i64,
+    path: &Path,
+    size: u64,
+    mtime: i64,
+) -> AppResult<()> {
+    conn.execute(
+        "INSERT INTO scan_files(source_id,path,size,mtime_ms,offset,last_scan_at)
+         VALUES (?1,?2,?3,?4,?3,?5)
+         ON CONFLICT(path) DO UPDATE SET source_id=excluded.source_id,size=excluded.size,
+           mtime_ms=excluded.mtime_ms,offset=excluded.offset,last_scan_at=excluded.last_scan_at,error=NULL",
+        params![
+            source_id,
+            path.to_string_lossy(),
+            size as i64,
+            mtime,
+            Utc::now().to_rfc3339()
+        ],
+    )
+    .map_err(db::to_error)?;
+    Ok(())
+}
+
+fn sync_dsh(conn: &Connection) -> AppResult<()> {
+    let Some((source_id, root)) = source(conn, "dsh_zstd")? else {
+        return Ok(());
+    };
+    let root = Path::new(&root);
+    if !root.is_dir() {
+        return Ok(());
+    }
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            entry.file_type().is_file()
+                && entry
+                    .path()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".jsonl.zstd"))
+        })
+    {
+        let path = entry.path();
+        let (unchanged, size, mtime) = file_stamp(conn, source_id, path)?;
+        if unchanged {
+            continue;
+        }
+        if import_dsh_file(conn, source_id, path)? {
+            mark_file(conn, source_id, path, size, mtime)?;
+        }
+    }
+    conn.execute(
+        "UPDATE sources SET last_scan_at=?1,error=NULL WHERE id=?2",
+        params![Utc::now().to_rfc3339(), source_id],
+    )
+    .map_err(db::to_error)?;
+    Ok(())
+}
+
+fn import_dsh_file(conn: &Connection, source_id: i64, path: &Path) -> AppResult<bool> {
+    let decoder = zstd::stream::read::Decoder::new(File::open(path).map_err(db::to_error)?)
+        .map_err(db::to_error)?;
+    let mut reader = BufReader::new(decoder);
+    let mut buffer = Vec::with_capacity(16 * 1024);
+    let mut session_id = path
+        .parent()
+        .and_then(|value| value.file_name())
+        .and_then(|value| value.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let mut selected = (
+        "unknown".to_string(),
+        "unknown".to_string(),
+        "default".to_string(),
+    );
+    let mut steps: HashMap<(i64, i64), DshStep> = HashMap::new();
+    let mut complete = true;
+    loop {
+        buffer.clear();
+        match reader.read_until(b'\n', &mut buffer) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => {
+                complete = false;
+                break;
+            }
+        }
+        let Ok(event) = serde_json::from_slice::<DshEvent>(&buffer) else {
+            continue;
+        };
+        if event.kind == "session" {
+            if let Some(id) = event.id {
+                session_id = id;
+            }
+            continue;
+        }
+        let Some(data) = event.data else {
+            continue;
+        };
+        if matches!(event.kind.as_str(), "model/selection" | "request/context") {
+            if let Some(provider) = data.provider {
+                selected.0 = provider;
+            }
+            if let Some(model) = data.model {
+                selected.1 = model;
+            }
+            if let Some(effort) = data.reasoning_effort {
+                selected.2 = normalize_effort(Some(&effort));
+            }
+            continue;
+        }
+        let (Some(turn), Some(step)) = (data.turn, data.step) else {
+            continue;
+        };
+        let key = (turn, step);
+        match event.kind.as_str() {
+            "step/start" => {
+                steps.insert(
+                    key,
+                    DshStep {
+                        turn,
+                        step,
+                        started: event.time.unwrap_or(0),
+                        provider: selected.0.clone(),
+                        model: selected.1.clone(),
+                        effort: selected.2.clone(),
+                        ..DshStep::default()
+                    },
+                );
+            }
+            "assistant/chunk" => {
+                if let Some(state) = steps.get_mut(&key) {
+                    let meaningful = data
+                        .chunk
+                        .as_ref()
+                        .and_then(|chunk| chunk.kind.as_deref())
+                        .is_some_and(|kind| !matches!(kind, "usage" | "finish"));
+                    if meaningful && state.first.is_none() {
+                        state.first = event.time;
+                    }
+                }
+            }
+            "assistant/message" => {
+                if let Some(state) = steps.get_mut(&key) {
+                    state.message_id = data.message.and_then(|message| message.id);
+                    state.usage = data.usage;
+                    if state.first.is_none() {
+                        state.first = event.time;
+                    }
+                }
+            }
+            "step/end" => {
+                if let Some(mut state) = steps.remove(&key) {
+                    if let Some(usage) = state.usage.take() {
+                        let completed = event.time.unwrap_or(state.started);
+                        let external_id = state.message_id.unwrap_or_else(|| {
+                            format!("{session_id}:{}:{}", state.turn, state.step)
+                        });
+                        upsert_observation(
+                            conn,
+                            source_id,
+                            &external_id,
+                            &state.provider,
+                            &state.model,
+                            &state.effort,
+                            state.started,
+                            Some(completed),
+                            Some((completed - state.started).max(0)),
+                            state.first.map(|first| (first - state.started).max(0)),
+                            "completed",
+                            normalized_dsh_input(&usage),
+                            usage.cache_read_tokens.max(0),
+                            usage.cache_write_tokens.max(0),
+                            usage.output_tokens.max(0),
+                            usage.reasoning_tokens.max(0),
+                            &Utc.timestamp_millis_opt(completed)
+                                .single()
+                                .unwrap_or_else(Utc::now)
+                                .to_rfc3339(),
+                        )?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(complete)
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct EvoUsage {
+    input: i64,
+    output: i64,
+    cache_read: i64,
+    cache_write: i64,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct EvoModel {
+    id: String,
+    provider: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum EvoModelValue {
+    Object(EvoModel),
+    Name(String),
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct EvoDetails {
+    event_name: Option<String>,
+    event: Option<String>,
+    model: Option<EvoModelValue>,
+    provider: Option<String>,
+    model_call_id: Option<String>,
+    provider_response_id: Option<String>,
+    response_id: Option<String>,
+    input_tokens: Option<i64>,
+    cached_input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    usage: Option<EvoUsage>,
+    messages: Option<IgnoredAny>,
+    tools: Option<IgnoredAny>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct EvoEvent {
+    kind: String,
+    ts_iso: String,
+    session_id: Option<String>,
+    task_id: Option<String>,
+    step_seq: Option<i64>,
+    details: EvoDetails,
+}
+
+#[derive(Default, Clone)]
+struct EvoResponse {
+    started: i64,
+    completed: i64,
+    provider: String,
+    model: String,
+    response_id: String,
+    usage: (i64, i64, i64, i64),
+}
+
+fn evo_model(value: Option<&EvoModelValue>, provider: Option<&str>) -> (String, String) {
+    match value {
+        Some(EvoModelValue::Object(model)) => (model.provider.clone(), model.id.clone()),
+        Some(EvoModelValue::Name(model)) => {
+            (provider.unwrap_or("unknown").to_string(), model.clone())
+        }
+        None => (provider.unwrap_or("unknown").to_string(), "unknown".into()),
+    }
+}
+
+fn sync_evox(conn: &Connection) -> AppResult<()> {
+    let Some((source_id, root)) = source(conn, "evox_observability")? else {
+        return Ok(());
+    };
+    let root = Path::new(&root);
+    if !root.is_dir() {
+        return Ok(());
+    }
+    for entry in WalkDir::new(root)
+        .max_depth(1)
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            entry.file_type().is_file()
+                && entry.path().extension().and_then(|value| value.to_str()) == Some("jsonl")
+        })
+    {
+        let path = entry.path();
+        let (unchanged, size, mtime) = file_stamp(conn, source_id, path)?;
+        if unchanged {
+            continue;
+        }
+        import_evox_file(conn, source_id, path)?;
+        mark_file(conn, source_id, path, size, mtime)?;
+    }
+    conn.execute(
+        "UPDATE sources SET last_scan_at=?1,error=NULL WHERE id=?2",
+        params![Utc::now().to_rfc3339(), source_id],
+    )
+    .map_err(db::to_error)?;
+    Ok(())
+}
+
+fn import_evox_file(conn: &Connection, source_id: i64, path: &Path) -> AppResult<()> {
+    let mut reader = BufReader::new(File::open(path).map_err(db::to_error)?);
+    let mut buffer = Vec::with_capacity(16 * 1024);
+    let mut requests: HashMap<(String, String), (i64, String, String)> = HashMap::new();
+    let mut responses: HashMap<String, EvoResponse> = HashMap::new();
+    loop {
+        buffer.clear();
+        if reader
+            .read_until(b'\n', &mut buffer)
+            .map_err(db::to_error)?
+            == 0
+        {
+            break;
+        }
+        let Ok(event) = serde_json::from_slice::<EvoEvent>(&buffer) else {
+            continue;
+        };
+        let event_name = event
+            .details
+            .event_name
+            .as_deref()
+            .or(event.details.event.as_deref())
+            .unwrap_or("");
+        let session = event.session_id.unwrap_or_default();
+        let task = event
+            .task_id
+            .unwrap_or_else(|| event.step_seq.unwrap_or(0).to_string());
+        let timestamp = parse_iso_ms(&event.ts_iso).unwrap_or(0);
+        if event.kind == "llm_request" && event_name == "request_dispatch" {
+            let (provider, model) = evo_model(
+                event.details.model.as_ref(),
+                event.details.provider.as_deref(),
+            );
+            requests.insert((session, task), (timestamp, provider, model));
+        } else if event.kind == "llm_response" && event_name == "response_complete" {
+            let response_id = event
+                .details
+                .response_id
+                .clone()
+                .or(event.details.provider_response_id.clone())
+                .unwrap_or_else(|| format!("{session}:{task}:{}", event.step_seq.unwrap_or(0)));
+            let (provider, model) = evo_model(
+                event.details.model.as_ref(),
+                event.details.provider.as_deref(),
+            );
+            let (started, request_provider, request_model) = requests
+                .get(&(session.clone(), task.clone()))
+                .cloned()
+                .unwrap_or((timestamp, provider.clone(), model.clone()));
+            let usage = event
+                .details
+                .usage
+                .map(|usage| {
+                    (
+                        usage.input,
+                        usage.cache_read,
+                        usage.cache_write,
+                        usage.output,
+                    )
+                })
+                .unwrap_or_default();
+            responses.insert(
+                response_id.clone(),
+                EvoResponse {
+                    started,
+                    completed: timestamp,
+                    provider: if provider == "unknown" {
+                        request_provider
+                    } else {
+                        provider
+                    },
+                    model: if model == "unknown" {
+                        request_model
+                    } else {
+                        model
+                    },
+                    response_id,
+                    usage,
+                },
+            );
+        } else if event.kind == "llm_response" && event_name == "token_usage_recorded" {
+            let response_id = event
+                .details
+                .provider_response_id
+                .clone()
+                .or(event.details.response_id.clone())
+                .unwrap_or_default();
+            let response = responses.remove(&response_id);
+            let (provider, model) = evo_model(
+                event.details.model.as_ref(),
+                event.details.provider.as_deref(),
+            );
+            let started = response
+                .as_ref()
+                .map(|value| value.started)
+                .unwrap_or(timestamp);
+            let completed = response
+                .as_ref()
+                .map(|value| value.completed)
+                .unwrap_or(timestamp);
+            let external_id = event.details.model_call_id.clone().unwrap_or_else(|| {
+                if response_id.is_empty() {
+                    format!("{session}:{task}:{}", event.step_seq.unwrap_or(0))
+                } else {
+                    response_id.clone()
+                }
+            });
+            let input = event.details.input_tokens.unwrap_or(0).max(0);
+            let cache = event.details.cached_input_tokens.unwrap_or(0).max(0);
+            let output = event.details.output_tokens.unwrap_or(0).max(0);
+            let resolved_provider = if provider == "unknown" {
+                response
+                    .as_ref()
+                    .map(|value| value.provider.as_str())
+                    .unwrap_or("unknown")
+            } else {
+                &provider
+            };
+            let resolved_model = if model == "unknown" {
+                response
+                    .as_ref()
+                    .map(|value| value.model.as_str())
+                    .unwrap_or("unknown")
+            } else {
+                &model
+            };
+            upsert_observation(
+                conn,
+                source_id,
+                &external_id,
+                resolved_provider,
+                resolved_model,
+                "default",
+                started,
+                Some(completed),
+                Some((completed - started).max(0)),
+                None,
+                "completed",
+                input,
+                cache,
+                0,
+                output,
+                0,
+                &event.ts_iso,
+            )?;
+        }
+    }
+    for (_, response) in responses {
+        let (input, cache_read, cache_write, output) = response.usage;
+        upsert_observation(
+            conn,
+            source_id,
+            &response.response_id,
+            &response.provider,
+            &response.model,
+            "default",
+            response.started,
+            Some(response.completed),
+            Some((response.completed - response.started).max(0)),
+            None,
+            "completed",
+            input.max(0),
+            cache_read.max(0),
+            cache_write.max(0),
+            output.max(0),
+            0,
+            &Utc.timestamp_millis_opt(response.completed)
+                .single()
+                .unwrap_or_else(Utc::now)
+                .to_rfc3339(),
+        )?;
+    }
     Ok(())
 }
 
@@ -1179,5 +1756,119 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cursor, (3000, "msg-1".into()));
+    }
+
+    #[test]
+    fn dsh_zstd_imports_completed_step_without_duplicate_tokens() {
+        use std::io::Write;
+
+        let (temp, path) = empty_meter();
+        let fixture = temp.path().join("session.jsonl.zstd");
+        let lines = [
+            r#"{"id":"session-1","type":"session","time":1000}"#,
+            r#"{"type":"model/selection","time":1000,"data":{"provider":"OpenAI","model":"gpt-5.6-sol","reasoningEffort":"high"}}"#,
+            r#"{"type":"step/start","time":1100,"data":{"turn":1,"step":2}}"#,
+            r#"{"type":"assistant/chunk","time":1400,"data":{"turn":1,"step":2,"chunk":{"type":"text","text":"discard me"}}}"#,
+            r#"{"type":"assistant/message","time":1800,"data":{"turn":1,"step":2,"message":{"id":"message-1","content":"discard me"},"usage":{"inputTokens":100,"cacheReadTokens":30,"cacheWriteTokens":10,"outputTokens":20,"reasoningTokens":5,"totalTokens":160}}}"#,
+            r#"{"type":"step/end","time":2100,"data":{"turn":1,"step":2}}"#,
+        ].join("\n") + "\n";
+        let mut encoder =
+            zstd::stream::write::Encoder::new(File::create(&fixture).unwrap(), 1).unwrap();
+        encoder.write_all(lines.as_bytes()).unwrap();
+        encoder.finish().unwrap();
+        let conn = db::open(&path).unwrap();
+        conn.execute("INSERT INTO sources(id,name,root_path,source_kind,enabled) VALUES (200,'DSH','/fixture','dsh_zstd',1)", []).unwrap();
+        assert!(import_dsh_file(&conn, 200, &fixture).unwrap());
+        assert!(import_dsh_file(&conn, 200, &fixture).unwrap());
+        let row: (i64, String, String, String, i64, i64, i64, i64, i64) = conn.query_row(
+            "SELECT count(*),provider,model,reasoning_effort,ttft_ms,duration_ms,uncached_input_tokens,cached_read_tokens,total_tokens FROM usage_observations WHERE source_id=200",
+            [],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?)),
+        ).unwrap();
+        assert_eq!(
+            row,
+            (
+                1,
+                "OpenAI".into(),
+                "gpt-5.6-sol".into(),
+                "high".into(),
+                300,
+                1000,
+                100,
+                30,
+                160
+            )
+        );
+    }
+
+    #[test]
+    fn dsh_truncated_frame_keeps_complete_observation_for_retry() {
+        use std::io::Write;
+
+        let (temp, path) = empty_meter();
+        let fixture = temp.path().join("partial.jsonl.zstd");
+        let lines = [
+            r#"{"id":"partial-session","type":"session","time":1000}"#,
+            r#"{"type":"step/start","time":1100,"data":{"turn":1,"step":1}}"#,
+            r#"{"type":"assistant/message","time":1300,"data":{"turn":1,"step":1,"message":{"id":"partial-message"},"usage":{"inputTokens":10,"outputTokens":5,"totalTokens":15}}}"#,
+            r#"{"type":"step/end","time":1500,"data":{"turn":1,"step":1}}"#,
+        ]
+        .join("\n")
+            + "\n";
+        let mut encoder =
+            zstd::stream::write::Encoder::new(File::create(&fixture).unwrap(), 1).unwrap();
+        encoder.write_all(lines.as_bytes()).unwrap();
+        encoder.finish().unwrap();
+        let mut tail_encoder = zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap();
+        tail_encoder
+            .write_all(br#"{"type":"assistant/chunk","time":1600,"data":{"turn":2"#)
+            .unwrap();
+        let mut partial_tail = tail_encoder.finish().unwrap();
+        partial_tail.truncate(partial_tail.len() - 2);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&fixture)
+            .unwrap()
+            .write_all(&partial_tail)
+            .unwrap();
+        let conn = db::open(&path).unwrap();
+        conn.execute("INSERT INTO sources(id,name,root_path,source_kind,enabled) VALUES (202,'DSH partial','/fixture','dsh_zstd',1)", []).unwrap();
+        assert!(!import_dsh_file(&conn, 202, &fixture).unwrap());
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM usage_observations WHERE source_id=202",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn evox_prefers_token_record_and_deduplicates_model_call() {
+        use std::io::Write;
+
+        let (temp, path) = empty_meter();
+        let fixture = temp.path().join("observability.jsonl");
+        let token = r#"{"kind":"llm_response","ts_iso":"2026-09-06T00:00:03Z","session_id":"session-1","task_id":"task-1","step_seq":1,"details":{"event_name":"token_usage_recorded","model_call_id":"call-1","provider_response_id":"response-1","provider":"OpenAI","model":"gpt-5.6-sol","input_tokens":100,"cached_input_tokens":30,"output_tokens":20}}"#;
+        let lines = [
+            r#"{"kind":"llm_request","ts_iso":"2026-09-06T00:00:01Z","session_id":"session-1","task_id":"task-1","step_seq":1,"details":{"event_name":"request_dispatch","model":{"id":"gpt-5.6-sol","provider":"OpenAI"},"messages":["discard me"]}}"#,
+            r#"{"kind":"llm_response","ts_iso":"2026-09-06T00:00:02Z","session_id":"session-1","task_id":"task-1","step_seq":1,"details":{"event_name":"response_complete","response_id":"response-1","model":{"id":"gpt-5.6-sol","provider":"OpenAI"},"usage":{"input":999,"output":999}}}"#,
+            token,
+            token,
+        ].join("\n") + "\n";
+        File::create(&fixture)
+            .unwrap()
+            .write_all(lines.as_bytes())
+            .unwrap();
+        let conn = db::open(&path).unwrap();
+        conn.execute("INSERT INTO sources(id,name,root_path,source_kind,enabled) VALUES (201,'EvoX','/fixture','evox_observability',1)", []).unwrap();
+        import_evox_file(&conn, 201, &fixture).unwrap();
+        let row: (i64, String, i64, i64, i64, Option<i64>) = conn.query_row(
+            "SELECT count(*),external_id,uncached_input_tokens,cached_read_tokens,total_tokens,ttft_ms FROM usage_observations WHERE source_id=201",
+            [],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+        ).unwrap();
+        assert_eq!(row, (1, "call-1".into(), 100, 30, 150, None));
     }
 }

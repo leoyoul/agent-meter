@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { meterApi } from './api'
 
-describe('browser mock API v0.3', () => {
+describe('browser mock API v0.4', () => {
   it('returns the four-metric contract', async () => {
     const filters = { period: 'realtime' as const }
     const [summary, series, matrix] = await Promise.all([meterApi.queryMetricSummary(filters), meterApi.queryMetricSeries(filters), meterApi.queryModelEffortStats(filters)])
@@ -10,7 +10,7 @@ describe('browser mock API v0.3', () => {
     expect(summary.averageEffectiveTps).toBeGreaterThan(0)
     expect(summary.estimatedCostNanoUsd).toBeGreaterThan(0)
     expect(series).toHaveLength(10)
-    expect(new Set(matrix.map(row => row.sourceName))).toEqual(new Set(['Codex', 'ZCode', 'OpenCode']))
+    expect(new Set(matrix.map(row => row.sourceName))).toEqual(new Set(['Codex', 'ZCode', 'OpenCode', 'DSH', 'EvoX']))
   })
 
   it('filters by source, model and effort', async () => {
@@ -31,9 +31,17 @@ describe('browser mock API v0.3', () => {
     const settings = await meterApi.getAppSettings()
     settings.menuMetrics.estimatedCost = true
     settings.menuPeriod = 'year'
+    settings.activeSourceKind = 'dsh_zstd'
     const updated = await meterApi.updateAppSettings(settings)
     expect(updated.menuMetrics.estimatedCost).toBe(true)
     expect(updated.menuPeriod).toBe('year')
+    expect(updated.activeSourceKind).toBe('dsh_zstd')
+  })
+
+  it('discovers all sources and exposes Claude as detection-only', async () => {
+    const discovered = await meterApi.discoverSources()
+    expect(discovered.map(source => source.name)).toEqual(['Codex', 'ZCode', 'OpenCode', 'DSH', 'Claude', 'EvoX'])
+    expect(discovered.find(source => source.name === 'Claude')).toMatchObject({ dataCapability: 'noUsageLog', limitation: '未发现可统计的本地 Token 记录' })
   })
 
   it('supports source and import lifecycle controls', async () => {

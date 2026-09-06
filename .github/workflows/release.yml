@@ -36,7 +36,11 @@ jobs:
           tagName: v__VERSION__
           releaseName: Agent Meter v__VERSION__
           releaseBody: |
-            Agent Meter v0.3.0 支持 Codex、ZCode 和 OpenCode，并以“速、首、量、费”统一展示本机调用。
+            Agent Meter v0.4.0 新增 DSH 与 EvoX 指标适配，并检测 Claude Desktop 的本地数据能力。仪表盘现在使用顶层来源标签，当前来源同时控制菜单栏指标。
+
+            仪表盘和设置已改为标准 macOS 窗口：打开时进入 Dock 和 ⌘Tab，最后一个窗口关闭后继续在菜单栏后台运行。设置可从托盘、主窗口或 ⌘, 打开。
+
+            四个菜单栏指标保持独立固定宽度，并改为更清晰的“大数值在上、指标名在下”布局。
 
             数据源保持本地只读，不上传会话数据。“费”是按版本化官方标准文本 API 单价计算的 USD 等价费用，不代表订阅套餐或实际账单；未知价格会显示覆盖率，不按零处理。
 

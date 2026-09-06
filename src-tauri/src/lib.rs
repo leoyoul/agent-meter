@@ -16,9 +16,9 @@ use settings::{AppSettings, SettingsState};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
-use tauri::menu::{Menu, MenuItem};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 #[tauri::command]
 fn discover_sources(state: State<'_, BackendState>) -> Result<Vec<SourceInfo>, String> {
@@ -122,11 +122,15 @@ fn reprice_usage(state: State<'_, BackendState>) -> Result<PricingCatalogStatus,
 
 #[tauri::command(rename_all = "camelCase")]
 fn update_source(
+    app: AppHandle,
     state: State<'_, BackendState>,
     source_id: i64,
     enabled: bool,
 ) -> Result<SourceInfo, String> {
-    db::update_source(&state.db_path, source_id, enabled)
+    let source = db::update_source(&state.db_path, source_id, enabled)?;
+    let _ = app.emit("sources-updated", ());
+    update_tray_titles(&app, state.inner());
+    Ok(source)
 }
 
 #[tauri::command]
@@ -139,20 +143,86 @@ fn update_app_settings(
     app: AppHandle,
     backend: State<'_, BackendState>,
     state: State<'_, SettingsState>,
-    settings: AppSettings,
+    mut settings: AppSettings,
 ) -> Result<AppSettings, String> {
+    if let Some(kind) = settings.active_source_kind.as_deref() {
+        if db::source_scope(&backend.db_path, kind)?.is_none() {
+            settings.active_source_kind = None;
+        }
+    }
     state.save(&settings)?;
     sync_metric_trays(&app, &settings)?;
     update_tray_titles(&app, backend.inner());
+    let _ = app.emit("settings-updated", settings.clone());
     Ok(settings)
 }
 
-fn show_main_window(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
+fn show_window(app: &AppHandle, label: &str) {
+    #[cfg(target_os = "macos")]
+    let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+    if let Some(window) = app.get_webview_window(label) {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
     }
+}
+
+fn show_main_window(app: &AppHandle) {
+    show_window(app, "main");
+}
+
+fn show_settings(app: &AppHandle) {
+    show_window(app, "settings");
+}
+
+#[tauri::command]
+fn show_dashboard_window(app: AppHandle) {
+    show_main_window(&app);
+}
+
+#[tauri::command]
+fn show_settings_window(app: AppHandle) {
+    show_settings(&app);
+}
+
+fn demote_if_no_visible_windows(app: &AppHandle) {
+    let visible = app
+        .webview_windows()
+        .values()
+        .any(|window| window.is_visible().unwrap_or(false));
+    if !visible {
+        #[cfg(target_os = "macos")]
+        let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+    }
+}
+
+fn app_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+    let settings = MenuItem::with_id(app, "app-settings", "设置…", true, Some("CmdOrCtrl+,"))?;
+    let app_submenu = Submenu::with_items(
+        app,
+        "Agent Meter",
+        true,
+        &[
+            &PredefinedMenuItem::about(app, None, None)?,
+            &PredefinedMenuItem::separator(app)?,
+            &settings,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::hide(app, None)?,
+            &PredefinedMenuItem::hide_others(app, None)?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::quit(app, None)?,
+        ],
+    )?;
+    let window_submenu = Submenu::with_items(
+        app,
+        "窗口",
+        true,
+        &[
+            &PredefinedMenuItem::minimize(app, None)?,
+            &PredefinedMenuItem::close_window(app, None)?,
+        ],
+    )?;
+    Menu::with_items(app, &[&app_submenu, &window_submenu])
 }
 
 fn tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
@@ -253,12 +323,8 @@ fn setup_trays(app: &tauri::App, settings: &AppSettings) -> tauri::Result<()> {
             let state = app.state::<BackendState>();
             importer::start_background_import(app.clone(), state.inner().clone());
         }
-        "settings" => {
-            show_main_window(app);
-            if let Some(window) = app.get_webview_window("main") {
-                use tauri::Emitter;
-                let _ = window.emit("open-settings", ());
-            }
+        "settings" | "app-settings" => {
+            show_settings(app);
         }
         "quit" => app.exit(0),
         _ => {}
@@ -268,50 +334,103 @@ fn setup_trays(app: &tauri::App, settings: &AppSettings) -> tauri::Result<()> {
 
 fn update_tray_titles(app: &AppHandle, state: &BackendState) {
     let settings = app.state::<SettingsState>().load();
+    let scope = settings
+        .active_source_kind
+        .as_deref()
+        .and_then(|kind| db::source_scope(&state.db_path, kind).ok().flatten());
+    let source_id = scope.as_ref().map(|value| value.0);
+    let source_name = scope
+        .as_ref()
+        .map(|value| value.1.as_str())
+        .unwrap_or("全部来源");
+    let unavailable_reason = settings.active_source_kind.as_deref().and_then(|kind| {
+        let scope = scope.as_ref()?;
+        if !scope.2 {
+            Some("该来源已停用")
+        } else if kind == "claude_desktop" {
+            Some("未发现可统计的本地 Token 记录")
+        } else if !std::path::Path::new(&scope.3).exists() {
+            Some("本机未发现该数据源")
+        } else {
+            None
+        }
+    });
     let Ok(summary) = analytics::query_metric_summary(
         &state.db_path,
         AnalyticsFilters {
             period: settings.menu_period,
+            source_id,
             ..AnalyticsFilters::default()
         },
     ) else {
         return;
     };
-    let token = compact_number(summary.tokens.total);
-    let ttft = summary
-        .average_ttft_ms
-        .map(|value| {
-            if value >= 1000.0 {
-                format!("{:.1}s", value / 1000.0)
-            } else {
-                format!("{value:.0}ms")
-            }
-        })
-        .unwrap_or_else(|| "--".into());
-    let tps = summary
-        .average_effective_tps
-        .map(|value| format!("{value:.1}"))
-        .unwrap_or_else(|| "--".into());
-    let cost = compact_cost(summary.estimated_cost_nano_usd, summary.pricing.complete);
+    let token =
+        unavailable_reason.map_or_else(|| compact_number(summary.tokens.total), |_| "--".into());
+    let ttft = unavailable_reason.map_or_else(
+        || {
+            summary
+                .average_ttft_ms
+                .map(|value| {
+                    if value >= 10_000.0 {
+                        format!("{:.0}s", value / 1000.0)
+                    } else if value >= 1000.0 {
+                        format!("{:.1}s", value / 1000.0)
+                    } else {
+                        format!("{value:.0}ms")
+                    }
+                })
+                .unwrap_or_else(|| "--".into())
+        },
+        |_| "--".into(),
+    );
+    let tps = unavailable_reason.map_or_else(
+        || {
+            summary
+                .average_effective_tps
+                .map(|value| {
+                    if value >= 100.0 {
+                        format!("{value:.0}")
+                    } else {
+                        format!("{value:.1}")
+                    }
+                })
+                .unwrap_or_else(|| "--".into())
+        },
+        |_| "--".into(),
+    );
+    let cost = unavailable_reason.map_or_else(
+        || compact_cost(summary.estimated_cost_nano_usd, summary.pricing.complete),
+        |_| "--".into(),
+    );
     let period = period_name(settings.menu_period);
+    let tooltip_prefix = unavailable_reason
+        .map(|reason| format!("{source_name} · {reason}"))
+        .unwrap_or_else(|| format!("{source_name} · {period}"));
     if let Some(tray) = app.tray_by_id("metric-tokens") {
         let _ = tray.set_icon_with_as_template(Some(metric_icon::render("量", &token)), true);
-        let _ = tray.set_tooltip(Some(format!("{period} Token 总量 {token}")));
+        let _ = tray.set_tooltip(Some(format!("{tooltip_prefix} · Token 总量 {token}")));
     }
     if let Some(tray) = app.tray_by_id("metric-ttft") {
         let _ = tray.set_icon_with_as_template(Some(metric_icon::render("首", &ttft)), true);
-        let _ = tray.set_tooltip(Some(format!("{period}平均首响 {ttft}")));
+        let _ = tray.set_tooltip(Some(format!("{tooltip_prefix} · 平均首响 {ttft}")));
     }
     if let Some(tray) = app.tray_by_id("metric-tps") {
         let _ = tray.set_icon_with_as_template(Some(metric_icon::render("速", &tps)), true);
-        let _ = tray.set_tooltip(Some(format!("{period}平均有效 TPS {tps}")));
+        let _ = tray.set_tooltip(Some(format!("{tooltip_prefix} · 平均有效 TPS {tps}")));
     }
     if let Some(tray) = app.tray_by_id("metric-cost") {
         let _ = tray.set_icon_with_as_template(Some(metric_icon::render("费", &cost)), true);
-        let _ = tray.set_tooltip(Some(format!(
-            "{period} API 等价费用 {cost} · 计价覆盖 {:.0}%",
-            summary.pricing.ratio * 100.0
-        )));
+        let tooltip = unavailable_reason.map_or_else(
+            || {
+                format!(
+                    "{tooltip_prefix} · API 等价费用 {cost} · 计价覆盖 {:.0}%",
+                    summary.pricing.ratio * 100.0
+                )
+            },
+            |_| format!("{tooltip_prefix} · API 等价费用 --"),
+        );
+        let _ = tray.set_tooltip(Some(tooltip));
     }
 }
 
@@ -344,7 +463,11 @@ fn compact_cost(nano_usd: i64, complete: bool) -> String {
 }
 
 fn compact_number(value: i64) -> String {
-    if value >= 1_000_000 {
+    if value >= 100_000_000 {
+        format!("{:.1}B", value as f64 / 1_000_000_000.0)
+    } else if value >= 10_000_000 {
+        format!("{:.0}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000_000 {
         format!("{:.1}M", value as f64 / 1_000_000.0)
     } else if value >= 1_000 {
         format!("{:.1}K", value as f64 / 1_000.0)
@@ -422,10 +545,11 @@ pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None,
+            Some(vec!["--background"]),
         ))
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .menu(app_menu)
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -440,12 +564,16 @@ pub fn run() {
             app.manage(settings_state);
             setup_trays(app, &settings)?;
             begin_background_loop(app.handle().clone(), state);
+            if !std::env::args().any(|argument| argument == "--background") {
+                show_main_window(app.handle());
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
+                demote_if_no_visible_windows(window.app_handle());
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -464,14 +592,24 @@ pub fn run() {
             reprice_usage,
             update_source,
             get_app_settings,
-            update_app_settings
+            update_app_settings,
+            show_dashboard_window,
+            show_settings_window
         ])
         .build(tauri::generate_context!())
         .expect("error while building Agent Meter");
 
     app.run(|app, event| {
         if let tauri::RunEvent::Reopen { .. } = event {
-            show_main_window(app);
+            let settings_visible = app
+                .get_webview_window("settings")
+                .and_then(|window| window.is_visible().ok())
+                .unwrap_or(false);
+            if settings_visible {
+                show_settings(app);
+            } else {
+                show_main_window(app);
+            }
         }
     });
 }
@@ -486,6 +624,8 @@ mod tests {
         assert_eq!(compact_number(999), "999");
         assert_eq!(compact_number(1_500), "1.5K");
         assert_eq!(compact_number(2_000_000), "2.0M");
+        assert_eq!(compact_number(64_654_000), "65M");
+        assert_eq!(compact_number(5_360_000_000), "5.4B");
     }
 
     #[test]

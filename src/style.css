@@ -51,3 +51,31 @@ button, select { font: inherit; color: inherit; } button { cursor: pointer; }
 @media (prefers-color-scheme: dark) { :root { --surface: rgba(28,35,43,.76); --solid: #151b22; --border: rgba(197,208,220,.14); --text: #edf2f7; --muted: #9ba7b5; --shadow: 0 16px 38px rgba(0,0,0,.25), inset 0 1px rgba(255,255,255,.08); } body { background: linear-gradient(135deg,rgba(57,92,126,.16),transparent 42%),linear-gradient(315deg,rgba(41,105,81,.1),transparent 45%),#11171d; }.select-wrap select,.segmented { background: rgba(9,13,18,.35); }.segmented button.active { background: rgba(69,78,91,.82); }.settings-drawer { background: rgba(23,29,36,.95); }.settings-card { background: rgba(7,11,16,.25); }.secondary-button,.danger-button { background: rgba(69,78,91,.42); } }
 @media (prefers-reduced-transparency: reduce) { .control-band,.panel,.kpi,.icon-button,.settings-drawer,.drawer-backdrop { backdrop-filter: none; }.control-band,.panel,.kpi,.icon-button,.settings-drawer { background: var(--solid); } }
 @media (prefers-reduced-motion: reduce) { *,*::before,*::after { animation-duration: .01ms !important; transition-duration: .01ms !important; } }
+
+/* v0.4 top-level sources and standalone settings window */
+.source-tabs { display: flex; gap: 5px; overflow-x: auto; margin: 0 -2px 10px; padding: 2px 2px 5px; scrollbar-width: none; }
+.source-tabs::-webkit-scrollbar { display: none; }
+.source-tab { position: relative; flex: 0 0 auto; min-width: 66px; height: 34px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 0 12px; border: 1px solid transparent; border-radius: 7px; color: var(--muted); background: transparent; font-size: 12px; font-weight: 650; }
+.source-tab:hover { background: rgba(102,116,134,.08); }
+.source-tab.active { color: var(--text); border-color: var(--border); background: var(--surface); box-shadow: 0 4px 14px rgba(36,49,68,.07), inset 0 1px rgba(255,255,255,.65); }
+.source-tab i { width: 6px; height: 6px; border-radius: 50%; background: var(--green); }
+.source-tab.unavailable i { background: #929ba5; }
+.source-tab:focus-visible { outline: 2px solid rgba(77,101,199,.55); outline-offset: 1px; }
+.control-band { grid-template-columns: minmax(330px,1.5fr) repeat(2,minmax(145px,.7fr)); }
+.source-unavailable { min-height: 250px; display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: 18px; margin-top: 15px; padding: 28px; border: 1px solid var(--border); border-radius: 8px; color: var(--muted); background: var(--surface); box-shadow: var(--shadow); }
+.source-unavailable > svg { color: var(--accent); }
+.source-unavailable span { font-size: 11px; font-weight: 700; color: var(--accent); }
+.source-unavailable h1 { margin: 4px 0 5px; color: var(--text); font-size: 20px; letter-spacing: 0; }
+.source-unavailable p { font-size: 12px; line-height: 1.5; }
+.settings-page { width: min(720px,100%); min-height: 100vh; margin: 0 auto; padding: 22px 28px 44px; }
+.settings-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; }
+.settings-header > small { color: var(--muted); font-size: 11px; }
+.settings-page > section { margin-bottom: 25px; }
+.settings-page > section:not(.privacy-note) { padding: 17px 18px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); backdrop-filter: blur(22px) saturate(140%); box-shadow: var(--shadow); }
+.settings-page h2, .settings-page h3 { margin: 0 0 10px; color: var(--muted); font-size: 12px; letter-spacing: 0; }
+.settings-page .source-row:last-child { border-bottom: 0; }
+.settings-page .source-row em { margin-top: 3px; }
+@media (max-width: 480px) { .settings-page { padding: 11px 9px 28px; }.source-unavailable { grid-template-columns: auto 1fr; }.source-unavailable button { grid-column: 1 / -1; } }
+@media (prefers-reduced-transparency: reduce) { .settings-page > section:not(.privacy-note), .source-unavailable { backdrop-filter: none; background: var(--solid); } }
+@media (max-width: 740px) { .control-band { grid-template-columns: repeat(2,minmax(0,1fr)); }.period-control { grid-column: span 2; } }
+@media (max-width: 480px) { .control-band { grid-template-columns: 1fr; }.period-control { grid-column: auto; } }
