@@ -1,158 +1,65 @@
+import { getVersion } from '@tauri-apps/api/app'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { getVersion } from '@tauri-apps/api/app'
 import { disable, enable, isEnabled } from '@tauri-apps/plugin-autostart'
 import { relaunch } from '@tauri-apps/plugin-process'
 import { check, type Update } from '@tauri-apps/plugin-updater'
-import type {
-  AppSettings,
-  AppUpdateState,
-  ImportStatus,
-  MetricFilters,
-  ModelStat,
-  Overview,
-  SourceInfo,
-  TaskRow,
-  TimeseriesPoint,
-} from './shared'
+import type { AnalyticsFilters, AppSettings, AppUpdateState, ImportStatus, MetricSeriesPoint, MetricSummary, ModelEffortStat, PricingCatalogStatus, SourceInfo } from './shared'
 
 export type MeterEvent = 'import-progress' | 'metrics-updated' | 'source-error'
-
 const isTauri = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
-
-const now = new Date()
-const iso = (offsetMinutes = 0) => new Date(now.getTime() + offsetMinutes * 60_000).toISOString()
+const iso = (minutes = 0) => new Date(Date.now() + minutes * 60_000).toISOString()
+const tokenSet = (uncachedInput: number, cachedRead: number, cachedWrite: number, output: number, reasoning: number) => ({ uncachedInput, cachedRead, cachedWrite, output, reasoning, total: uncachedInput + cachedRead + cachedWrite + output })
 
 const sources: SourceInfo[] = [
   { id: 1, name: 'Codex', rootPath: '~/.codex', enabled: true, available: true, fileCount: 546, totalBytes: 2_577_980_416, lastScanAt: iso(-2), error: null },
-  { id: 2, name: 'Yodex', rootPath: '~/.yodex', enabled: true, available: true, fileCount: 2, totalBytes: 4_718_592, lastScanAt: iso(-8), error: null },
+  { id: 2, name: 'ZCode', rootPath: '~/.zcode/cli/db/db.sqlite', enabled: true, available: true, fileCount: 1, totalBytes: 8_912_896, lastScanAt: iso(-1), error: null },
+  { id: 3, name: 'OpenCode', rootPath: '~/.local/share/opencode/opencode.db', enabled: true, available: true, fileCount: 1, totalBytes: 29_360_128, lastScanAt: iso(-1), error: null },
 ]
-
-const modelStats: ModelStat[] = [
-  { model: 'codex-pro', reasoningEffort: 'high', turnCount: 84, tokens: { input: 1_842_300, cachedInput: 1_224_900, output: 184_600, reasoning: 52_300, total: 2_079_200 }, medianTtftMs: 870, p95TtftMs: 1640, medianDurationMs: 38_400, p95DurationMs: 126_000, medianEffectiveTps: 12.7 },
-  { model: 'codex-balanced', reasoningEffort: 'medium', turnCount: 61, tokens: { input: 906_800, cachedInput: 601_200, output: 97_400, reasoning: 31_900, total: 1_036_100 }, medianTtftMs: 690, p95TtftMs: 1280, medianDurationMs: 26_900, p95DurationMs: 89_000, medianEffectiveTps: 15.4 },
-  { model: 'codex-fast', reasoningEffort: 'medium', turnCount: 112, tokens: { input: 1_214_000, cachedInput: 823_500, output: 143_700, reasoning: 28_600, total: 1_386_300 }, medianTtftMs: 510, p95TtftMs: 940, medianDurationMs: 19_300, p95DurationMs: 64_000, medianEffectiveTps: 18.9 },
+const matrix: ModelEffortStat[] = [
+  { sourceId: 1, sourceName: 'Codex', provider: 'OpenAI', model: 'gpt-5.6-sol', reasoningEffort: 'high', observationCount: 42, averageTtftMs: 812, averageEffectiveTps: 17.4, tokens: tokenSet(146_200, 892_400, 0, 84_600, 31_200), estimatedCostNanoUsd: 2_636_160_000, pricing: { pricedObservations: 42, totalObservations: 42, pricedTokens: 1_123_200, totalTokens: 1_123_200, ratio: 1, complete: true } },
+  { sourceId: 2, sourceName: 'ZCode', provider: 'omlx', model: 'Qwen3.8-27B-MLX-4bit', reasoningEffort: 'default', observationCount: 31, averageTtftMs: 386, averageEffectiveTps: 29.8, tokens: tokenSet(97_800, 188_100, 12_400, 61_800, 18_500), estimatedCostNanoUsd: 0, pricing: { pricedObservations: 31, totalObservations: 31, pricedTokens: 360_100, totalTokens: 360_100, ratio: 1, complete: true } },
+  { sourceId: 3, sourceName: 'OpenCode', provider: 'MiniMax', model: 'MiniMax-M2.7', reasoningEffort: 'medium', observationCount: 24, averageTtftMs: 640, averageEffectiveTps: 22.1, tokens: tokenSet(116_400, 421_300, 8_200, 54_700, 14_300), estimatedCostNanoUsd: 136_642_500, pricing: { pricedObservations: 24, totalObservations: 24, pricedTokens: 600_600, totalTokens: 600_600, ratio: 1, complete: true } },
+  { sourceId: 3, sourceName: 'OpenCode', provider: 'custom', model: 'muse-pro', reasoningEffort: 'unknown', observationCount: 9, averageTtftMs: null, averageEffectiveTps: null, tokens: tokenSet(32_100, 0, 0, 11_900, 2_600), estimatedCostNanoUsd: 0, pricing: { pricedObservations: 0, totalObservations: 9, pricedTokens: 0, totalTokens: 44_000, ratio: 0, complete: false } },
 ]
-
-const tasks: TaskRow[] = [
-  { turnId: 'turn-01', sessionId: 'demo-root-01', parentThreadId: null, sourceName: 'Codex', project: 'demo-dashboard', cwd: '/Users/demo/Projects/demo-dashboard', model: 'codex-pro', reasoningEffort: 'high', agentKind: 'root', agentPath: '/root', startedAt: iso(-13), completedAt: iso(-2), durationMs: 658_000, ttftMs: 920, effectiveTps: 11.8, tokens: { input: 248_400, cachedInput: 181_000, output: 22_600, reasoning: 6_800, total: 277_800 }, status: 'completed' },
-  { turnId: 'turn-02', sessionId: 'demo-sub-01', parentThreadId: 'demo-root-01', sourceName: 'Codex', project: 'demo-dashboard', cwd: '/Users/demo/Projects/demo-dashboard', model: 'codex-fast', reasoningEffort: 'medium', agentKind: 'subagent', agentPath: '/root/frontend_agent', startedAt: iso(-11), completedAt: iso(-4), durationMs: 421_000, ttftMs: 480, effectiveTps: 19.6, tokens: { input: 142_800, cachedInput: 96_000, output: 18_700, reasoning: 3_600, total: 165_100 }, status: 'completed' },
-  { turnId: 'turn-03', sessionId: 'demo-sub-02', parentThreadId: 'demo-root-01', sourceName: 'Codex', project: 'demo-dashboard', cwd: '/Users/demo/Projects/demo-dashboard', model: 'codex-balanced', reasoningEffort: 'high', agentKind: 'subagent', agentPath: '/root/parser_agent', startedAt: iso(-9), completedAt: null, durationMs: null, ttftMs: 720, effectiveTps: null, tokens: { input: 91_400, cachedInput: 66_200, output: 7_900, reasoning: 2_100, total: 101_400 }, status: 'running' },
-  { turnId: 'turn-04', sessionId: 'demo-root-02', parentThreadId: null, sourceName: 'Yodex', project: 'sample-service', cwd: '/Users/demo/Projects/sample-service', model: 'codex-fast', reasoningEffort: 'medium', agentKind: 'root', agentPath: '/root', startedAt: iso(-240), completedAt: iso(-218), durationMs: 1_320_000, ttftMs: 530, effectiveTps: 17.2, tokens: { input: 184_300, cachedInput: 120_400, output: 19_300, reasoning: 4_100, total: 207_700 }, status: 'completed' },
-]
-
-const overview: Overview = {
-  tokens: { input: 1_186_420, cachedInput: 784_210, output: 126_840, reasoning: 31_960, total: 1_345_220 },
-  turnCount: 47, runningCount: 1, subagentCount: 18,
-  medianTtftMs: 720, p95TtftMs: 1480, medianDurationMs: 31_600, p95DurationMs: 104_000,
-  medianEffectiveTps: 15.8, recentMedianTtftMs: 680, recentMedianEffectiveTps: 16.4, lastUpdatedAt: iso(-1),
+const series: MetricSeriesPoint[] = Array.from({ length: 10 }, (_, i) => ({ bucket: `call-${i + 1}`, label: `${String(9 + i).padStart(2, '0')}:20`, observationCount: 1, averageTtftMs: i === 2 ? null : 490 + i * 32, averageEffectiveTps: i === 2 ? null : 15.2 + (i % 4) * 2.3, totalTokens: 44_000 + i * 13_700, estimatedCostNanoUsd: i === 2 ? 0 : 52_000_000 + i * 8_900_000 }))
+const summarize = (rows: ModelEffortStat[]): MetricSummary => {
+  const tokens = rows.reduce((a, row) => ({ uncachedInput: a.uncachedInput + row.tokens.uncachedInput, cachedRead: a.cachedRead + row.tokens.cachedRead, cachedWrite: a.cachedWrite + row.tokens.cachedWrite, output: a.output + row.tokens.output, reasoning: a.reasoning + row.tokens.reasoning, total: a.total + row.tokens.total }), tokenSet(0, 0, 0, 0, 0))
+  const pricedTokens = rows.reduce((sum, row) => sum + row.pricing.pricedTokens, 0)
+  const ttft = rows.flatMap(row => row.averageTtftMs == null ? [] : [row.averageTtftMs])
+  const tps = rows.flatMap(row => row.averageEffectiveTps == null ? [] : [row.averageEffectiveTps])
+  return { period: 'realtime', observationCount: rows.reduce((sum, row) => sum + row.observationCount, 0), averageTtftMs: ttft.length ? ttft.reduce((a, b) => a + b, 0) / ttft.length : null, averageEffectiveTps: tps.length ? tps.reduce((a, b) => a + b, 0) / tps.length : null, tokens, estimatedCostNanoUsd: rows.reduce((sum, row) => sum + row.estimatedCostNanoUsd, 0), pricing: { pricedObservations: rows.reduce((sum, row) => sum + row.pricing.pricedObservations, 0), totalObservations: rows.reduce((sum, row) => sum + row.pricing.totalObservations, 0), pricedTokens, totalTokens: tokens.total, ratio: tokens.total ? pricedTokens / tokens.total : 1, complete: pricedTokens === tokens.total }, lastUpdatedAt: iso(-1) }
 }
-
-const timeseries: TimeseriesPoint[] = Array.from({ length: 14 }, (_, i) => {
-  const date = new Date(now); date.setDate(now.getDate() - 13 + i)
-  const wave = [62, 78, 55, 91, 104, 82, 48, 118, 94, 126, 88, 139, 107, 131][i] * 10_000
-  return { bucket: date.toISOString().slice(0, 10), inputTokens: Math.round(wave * .82), cachedInputTokens: Math.round(wave * .56), outputTokens: Math.round(wave * .13), reasoningTokens: Math.round(wave * .05), totalTokens: wave, medianTtftMs: 520 + i * 17, medianEffectiveTps: 13 + (i % 5) * 1.3, turnCount: 12 + i * 2 }
-})
-
-let mockStatus: ImportStatus = { running: false, paused: false, filesDone: 546, filesTotal: 546, bytesDone: 2_577_980_416, bytesTotal: 2_577_980_416, currentFile: null, startedAt: iso(-48), message: '索引已是最新' }
+let mockStatus: ImportStatus = { running: false, paused: false, filesDone: 548, filesTotal: 548, bytesDone: 2_616_253_440, bytesTotal: 2_616_253_440, currentFile: null, startedAt: iso(-48), message: '三个数据源均已同步' }
 let mockAutostart = false
-let mockSettings: AppSettings = {
-  menuMetrics: { todayTokens: true, ttft: false, effectiveTps: false },
-  updates: { automaticCheck: true, lastCheckedAt: null },
-}
+let mockSettings: AppSettings = { menuMetrics: { todayTokens: true, ttft: false, effectiveTps: false, estimatedCost: false }, menuPeriod: 'realtime', updates: { automaticCheck: true, lastCheckedAt: null } }
 let pendingUpdate: Update | null = null
-
+const pricing: PricingCatalogStatus = { version: '2026-09-06.1', currency: 'USD', verifiedAt: '2026-09-06', pricedObservations: 97, totalObservations: 106, rates: [
+  { vendor: 'OpenAI', model: 'gpt-5.6-sol', aliases: ['gpt-5.6'], currency: 'USD', inputUsdPerMillion: '4', cachedReadUsdPerMillion: '0.4', cachedWriteUsdPerMillion: '5', outputUsdPerMillion: '20', effectiveFrom: '2026-01-01', effectiveTo: null, sourceUrl: 'https://developers.openai.com/api/docs/models/gpt-5.6-sol', verifiedAt: '2026-09-06' },
+  { vendor: 'MiniMax', model: 'MiniMax-M2.7', aliases: [], currency: 'USD', inputUsdPerMillion: '0.3', cachedReadUsdPerMillion: '0.06', cachedWriteUsdPerMillion: '0.375', outputUsdPerMillion: '1.2', effectiveFrom: '2026-01-01', effectiveTo: null, sourceUrl: 'https://platform.minimax.io/docs/guides/pricing-paygo', verifiedAt: '2026-09-06' },
+] }
+const call = async <T>(command: string, args?: Record<string, unknown>, fallback?: () => T): Promise<T> => { if (isTauri()) return invoke<T>(command, args); await new Promise(resolve => setTimeout(resolve, 60)); if (!fallback) throw new Error(`Mock not implemented: ${command}`); return fallback() }
+const filtered = (filters: AnalyticsFilters) => matrix.filter(row => (!filters.sourceId || row.sourceId === filters.sourceId) && (!filters.model || row.model === filters.model) && (!filters.reasoningEffort || row.reasoningEffort === filters.reasoningEffort))
 const mockHasUpdate = () => typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('update') === 'available'
-
-const call = async <T>(command: string, args?: Record<string, unknown>, fallback?: () => T): Promise<T> => {
-  if (isTauri()) return invoke<T>(command, args)
-  await new Promise(resolve => setTimeout(resolve, 120))
-  if (!fallback) throw new Error(`Mock not implemented: ${command}`)
-  return fallback()
-}
-
-const filterTasks = (filters: MetricFilters) => tasks.filter(task =>
-  (!filters.sourceId || sources.find(source => source.id === filters.sourceId)?.name === task.sourceName) &&
-  (!filters.model || task.model === filters.model) &&
-  (!filters.project || task.project === filters.project) &&
-  (!filters.agentKind || filters.agentKind === 'all' || task.agentKind === filters.agentKind),
-)
 
 export const meterApi = {
   isTauri,
-  discoverSources: () => call<SourceInfo[]>('discover_sources', undefined, () => sources.map(source => ({ ...source }))),
-  startImport: (force = false) => call<ImportStatus>('start_import', { force }, () => {
-    mockStatus = { ...mockStatus, running: true, paused: false, startedAt: new Date().toISOString(), message: force ? '正在重建索引' : '正在检查新记录' }
-    return { ...mockStatus }
-  }),
-  pauseImport: () => call<ImportStatus>('pause_import', undefined, () => {
-    mockStatus = { ...mockStatus, running: false, paused: true, message: '导入已暂停' }
-    return { ...mockStatus }
-  }),
+  discoverSources: () => call<SourceInfo[]>('discover_sources', undefined, () => structuredClone(sources)),
+  startImport: (force = false) => call<ImportStatus>('start_import', { force }, () => (mockStatus = { ...mockStatus, running: true, paused: false, message: force ? '正在重建索引' : '正在同步三个数据源' })),
+  pauseImport: () => call<ImportStatus>('pause_import', undefined, () => (mockStatus = { ...mockStatus, running: false, paused: true, message: '导入已暂停' })),
   getImportStatus: () => call<ImportStatus>('get_import_status', undefined, () => ({ ...mockStatus })),
-  queryOverview: (filters: MetricFilters) => call<Overview>('query_overview', { filters }, () => ({ ...overview })),
-  queryTimeseries: (filters: MetricFilters) => call<TimeseriesPoint[]>('query_timeseries', { filters }, () => timeseries.map(point => ({ ...point }))),
-  queryModelStats: (filters: MetricFilters) => call<ModelStat[]>('query_model_stats', { filters }, () => modelStats.filter(row => !filters.model || row.model === filters.model).map(row => ({ ...row, tokens: { ...row.tokens } }))),
-  queryTasks: (filters: MetricFilters) => call<TaskRow[]>('query_tasks', { filters }, () => filterTasks(filters).map(task => ({ ...task, tokens: { ...task.tokens } }))),
-  updateSource: (id: number, enabled: boolean) => call<SourceInfo>('update_source', { id, enabled }, () => {
-    const source = sources.find(item => item.id === id)!
-    source.enabled = enabled
-    return { ...source }
-  }),
+  queryMetricSummary: (filters: AnalyticsFilters) => call<MetricSummary>('query_metric_summary', { filters }, () => ({ ...summarize(filtered(filters)), period: filters.period })),
+  queryMetricSeries: (filters: AnalyticsFilters) => call<MetricSeriesPoint[]>('query_metric_series', { filters }, () => structuredClone(series)),
+  queryModelEffortStats: (filters: AnalyticsFilters) => call<ModelEffortStat[]>('query_model_effort_stats', { filters }, () => structuredClone(filtered(filters))),
+  getPricingCatalogStatus: () => call<PricingCatalogStatus>('get_pricing_catalog_status', undefined, () => structuredClone(pricing)),
+  repriceUsage: () => call<PricingCatalogStatus>('reprice_usage', undefined, () => structuredClone(pricing)),
+  updateSource: (id: number, enabled: boolean) => call<SourceInfo>('update_source', { id, enabled }, () => { const source = sources.find(item => item.id === id)!; source.enabled = enabled; return { ...source } }),
   getAppSettings: () => call<AppSettings>('get_app_settings', undefined, () => structuredClone(mockSettings)),
-  updateAppSettings: (settings: AppSettings) => call<AppSettings>('update_app_settings', { settings }, () => {
-    mockSettings = structuredClone(settings)
-    return structuredClone(mockSettings)
-  }),
-  getCurrentVersion: async () => isTauri() ? getVersion() : '0.2.0',
-  checkForUpdate: async (): Promise<AppUpdateState> => {
-    const currentVersion = await meterApi.getCurrentVersion()
-    if (!isTauri()) {
-      await new Promise(resolve => setTimeout(resolve, 180))
-      return mockHasUpdate()
-        ? { phase: 'available', currentVersion, version: '0.2.1', notes: '改进菜单栏显示和更新体验。', downloadedBytes: 0 }
-        : { phase: 'current', currentVersion, downloadedBytes: 0 }
-    }
-    if (pendingUpdate) {
-      await pendingUpdate.close()
-      pendingUpdate = null
-    }
-    const update = await check({ timeout: 20_000 })
-    if (!update) return { phase: 'current', currentVersion, downloadedBytes: 0 }
-    pendingUpdate = update
-    return { phase: 'available', currentVersion, version: update.version, notes: update.body, downloadedBytes: 0 }
-  },
-  downloadAndInstallUpdate: async (onState: (state: AppUpdateState) => void) => {
-    const currentVersion = await meterApi.getCurrentVersion()
-    if (!isTauri()) {
-      const totalBytes = 8_000_000
-      onState({ phase: 'downloading', currentVersion, version: '0.2.1', downloadedBytes: 3_200_000, totalBytes })
-      await new Promise(resolve => setTimeout(resolve, 120))
-      onState({ phase: 'ready', currentVersion, version: '0.2.1', downloadedBytes: totalBytes, totalBytes })
-      return
-    }
-    if (!pendingUpdate) throw new Error('没有可安装的更新，请先检查更新')
-    const update = pendingUpdate
-    let downloadedBytes = 0
-    let totalBytes: number | undefined
-    await update.download(event => {
-      if (event.event === 'Started') totalBytes = event.data.contentLength
-      if (event.event === 'Progress') downloadedBytes += event.data.chunkLength
-      onState({ phase: 'downloading', currentVersion, version: update.version, notes: update.body, downloadedBytes, totalBytes })
-    }, { timeout: 120_000 })
-    await meterApi.pauseImport()
-    await update.install()
-    onState({ phase: 'ready', currentVersion, version: update.version, notes: update.body, downloadedBytes, totalBytes })
-    await relaunch()
-  },
+  updateAppSettings: (settings: AppSettings) => call<AppSettings>('update_app_settings', { settings }, () => (mockSettings = structuredClone(settings))),
+  getCurrentVersion: async () => isTauri() ? getVersion() : '0.3.0',
+  checkForUpdate: async (): Promise<AppUpdateState> => { const currentVersion = await meterApi.getCurrentVersion(); if (!isTauri()) return mockHasUpdate() ? { phase: 'available', currentVersion, version: '0.3.1', notes: '稳定性改进。', downloadedBytes: 0 } : { phase: 'current', currentVersion, downloadedBytes: 0 }; if (pendingUpdate) { await pendingUpdate.close(); pendingUpdate = null }; const update = await check({ timeout: 20_000 }); if (!update) return { phase: 'current', currentVersion, downloadedBytes: 0 }; pendingUpdate = update; return { phase: 'available', currentVersion, version: update.version, notes: update.body, downloadedBytes: 0 } },
+  downloadAndInstallUpdate: async (onState: (state: AppUpdateState) => void) => { const currentVersion = await meterApi.getCurrentVersion(); if (!isTauri()) { onState({ phase: 'ready', currentVersion, version: '0.3.1', downloadedBytes: 1, totalBytes: 1 }); return }; if (!pendingUpdate) throw new Error('没有可安装的更新，请先检查更新'); const update = pendingUpdate; let downloadedBytes = 0; let totalBytes: number | undefined; await update.download(event => { if (event.event === 'Started') totalBytes = event.data.contentLength; if (event.event === 'Progress') downloadedBytes += event.data.chunkLength; onState({ phase: 'downloading', currentVersion, version: update.version, notes: update.body, downloadedBytes, totalBytes }) }, { timeout: 120_000 }); await meterApi.pauseImport(); await update.install(); onState({ phase: 'ready', currentVersion, version: update.version, downloadedBytes, totalBytes }); await relaunch() },
   isAutostartEnabled: async () => isTauri() ? isEnabled() : mockAutostart,
-  setAutostartEnabled: async (enabled: boolean) => {
-    if (isTauri()) enabled ? await enable() : await disable()
-    else mockAutostart = enabled
-    return enabled
-  },
-  on: async <T>(event: MeterEvent, handler: (payload: T) => void): Promise<UnlistenFn> => {
-    if (isTauri()) return listen<T>(event, ({ payload }) => handler(payload))
-    return () => undefined
-  },
+  setAutostartEnabled: async (enabledValue: boolean) => { if (isTauri()) enabledValue ? await enable() : await disable(); else mockAutostart = enabledValue; return enabledValue },
+  on: async <T>(event: MeterEvent, handler: (payload: T) => void): Promise<UnlistenFn> => isTauri() ? listen<T>(event, ({ payload }) => handler(payload)) : () => undefined,
 }

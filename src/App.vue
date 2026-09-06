@@ -1,257 +1,122 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { Activity, Bot, Check, ChevronDown, CircleAlert, CloudDownload, Database, Gauge, LoaderCircle, PanelTop, Pause, Play, RefreshCw, Settings, Sparkles, Users, X } from 'lucide-vue-next'
+import { Activity, BarChart3, Check, ChevronDown, CircleAlert, CloudDownload, Coins, Database, Gauge, Info, LoaderCircle, PanelTop, Pause, Play, RefreshCw, Settings, Timer, X, Zap } from 'lucide-vue-next'
 import { meterApi } from './api'
-import type { AgentKind, AppSettings, AppUpdateState, ImportStatus, MetricFilters, ModelStat, Overview, SourceInfo, TaskRow, TimeseriesPoint } from './shared'
+import type { AnalyticsFilters, AppSettings, AppUpdateState, ImportStatus, MetricPeriod, MetricSeriesPoint, MetricSummary, ModelEffortStat, PricingCatalogStatus, SourceInfo } from './shared'
 
-const localDate = (date: Date) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
-const now = new Date()
-const before = new Date(now); before.setDate(before.getDate() - 13)
-const filters = ref<MetricFilters>({ startDate: localDate(before), endDate: localDate(now), agentKind: 'all' })
-const overview = ref<Overview | null>(null)
-const series = ref<TimeseriesPoint[]>([])
-const models = ref<ModelStat[]>([])
-const tasks = ref<TaskRow[]>([])
+const periods: Array<[MetricPeriod, string]> = [['realtime', '实时'], ['today', '今日'], ['week', '本周'], ['month', '本月'], ['year', '本年']]
+const filters = ref<AnalyticsFilters>({ period: 'realtime' })
+const summary = ref<MetricSummary | null>(null)
+const series = ref<MetricSeriesPoint[]>([])
+const stats = ref<ModelEffortStat[]>([])
 const sources = ref<SourceInfo[]>([])
+const pricing = ref<PricingCatalogStatus | null>(null)
 const importStatus = ref<ImportStatus | null>(null)
 const loading = ref(true)
 const error = ref('')
+const lastAction = ref('')
 const settingsOpen = ref(false)
 const autostartEnabled = ref(false)
-const appSettings = ref<AppSettings>({ menuMetrics: { todayTokens: true, ttft: false, effectiveTps: false }, updates: { automaticCheck: true, lastCheckedAt: null } })
-const updateState = ref<AppUpdateState>({ phase: 'idle', currentVersion: '0.2.0', downloadedBytes: 0 })
-const lastAction = ref('')
+const appSettings = ref<AppSettings>({ menuMetrics: { todayTokens: true, ttft: false, effectiveTps: false, estimatedCost: false }, menuPeriod: 'realtime', updates: { automaticCheck: true, lastCheckedAt: null } })
+const updateState = ref<AppUpdateState>({ phase: 'idle', currentVersion: '0.3.0', downloadedBytes: 0 })
 const unlisteners: Array<() => void> = []
 let updateDelay: ReturnType<typeof setTimeout> | undefined
 let updateInterval: ReturnType<typeof setInterval> | undefined
 
-const projects = computed(() => [...new Set(tasks.value.map(task => task.project).filter(Boolean))].sort())
-const modelNames = computed(() => [...new Set(models.value.map(item => item.model))].sort())
-const sourceSelected = computed(() => sources.value.find(source => source.id === filters.value.sourceId)?.name ?? '全部数据源')
-const maxTokens = computed(() => Math.max(...series.value.map(point => point.totalTokens), 1))
-const chartPoints = computed(() => series.value.map((point, index) => {
-  const x = series.value.length <= 1 ? 0 : index / (series.value.length - 1) * 100
-  const y = 94 - point.totalTokens / maxTokens.value * 82
-  return `${x},${y}`
-}).join(' '))
+const modelNames = computed(() => [...new Set(stats.value.map(row => row.model))].sort())
+const efforts = computed(() => [...new Set(stats.value.map(row => row.reasoningEffort))].sort())
+const sourceName = computed(() => sources.value.find(item => item.id === filters.value.sourceId)?.name ?? '全部来源')
+const maxSeries = computed(() => Math.max(...series.value.map(point => point.totalTokens), 1))
+const chartPoints = computed(() => series.value.map((point, index) => `${series.value.length <= 1 ? 50 : index / (series.value.length - 1) * 100},${92 - point.totalTokens / maxSeries.value * 80}`).join(' '))
 const chartArea = computed(() => `0,100 ${chartPoints.value} 100,100`)
-const rootTasks = computed(() => tasks.value.filter(task => task.agentKind === 'root'))
-
-const formatCompact = (value: number) => new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 1 }).format(value)
-const formatDuration = (value: number | null) => value == null ? '—' : value < 1000 ? `${Math.round(value)} ms` : value < 60_000 ? `${(value / 1000).toFixed(1)} s` : `${(value / 60_000).toFixed(1)} min`
-const formatTps = (value: number | null) => value == null ? '—' : value.toFixed(1)
-const formatTime = (value: string | null) => value ? new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(new Date(value)) : '—'
-const formatBytes = (value: number) => value >= 1_073_741_824 ? `${(value / 1_073_741_824).toFixed(1)} GB` : `${Math.round(value / 1_048_576)} MB`
-const childCount = (sessionId: string) => tasks.value.filter(task => task.parentThreadId === sessionId).length
 const updateProgress = computed(() => updateState.value.totalBytes ? Math.min(100, updateState.value.downloadedBytes / updateState.value.totalBytes * 100) : 0)
-const cloneSettings = (value: AppSettings): AppSettings => ({
-  menuMetrics: { ...value.menuMetrics },
-  updates: { ...value.updates },
-})
+const periodLabel = computed(() => periods.find(([key]) => key === filters.value.period)?.[1] ?? '实时')
+const pricedPercent = computed(() => Math.round((summary.value?.pricing.ratio ?? 1) * 100))
+const formatCompact = (value: number) => new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 1 }).format(value)
+const formatDuration = (value: number | null | undefined) => value == null ? '—' : value < 1000 ? `${Math.round(value)} ms` : `${(value / 1000).toFixed(1)} s`
+const formatTps = (value: number | null | undefined) => value == null ? '—' : value.toFixed(1)
+const formatCost = (nano: number, complete = true) => `${new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: nano >= 10_000_000_000 ? 0 : 2, maximumFractionDigits: nano >= 1_000_000_000 ? 2 : 4 }).format(nano / 1_000_000_000)}${complete ? '' : '+'}`
+const formatTime = (value: string | null | undefined) => value ? new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(new Date(value)) : '—'
+const formatBytes = (value: number) => value >= 1_073_741_824 ? `${(value / 1_073_741_824).toFixed(1)} GB` : `${Math.max(0, value / 1_048_576).toFixed(value < 10_485_760 ? 1 : 0)} MB`
+const effortName = (value: string) => ({ default: '默认', unknown: '未知' }[value] ?? value)
+const cloneSettings = (value: AppSettings): AppSettings => ({ menuMetrics: { ...value.menuMetrics }, menuPeriod: value.menuPeriod, updates: { ...value.updates } })
 
 async function loadAll(silent = false) {
   if (!silent) loading.value = true
   error.value = ''
   try {
-    const f = { ...filters.value }
-    const [nextOverview, nextSeries, nextModels, nextTasks, nextStatus] = await Promise.all([
-      meterApi.queryOverview(f), meterApi.queryTimeseries(f), meterApi.queryModelStats(f), meterApi.queryTasks(f), meterApi.getImportStatus(),
-    ])
-    overview.value = nextOverview; series.value = nextSeries; models.value = nextModels; tasks.value = nextTasks; importStatus.value = nextStatus
-  } catch (reason) {
-    error.value = reason instanceof Error ? reason.message : String(reason)
-  } finally { loading.value = false }
+    const next = { ...filters.value }
+    const [nextSummary, nextSeries, nextStats, nextStatus] = await Promise.all([meterApi.queryMetricSummary(next), meterApi.queryMetricSeries(next), meterApi.queryModelEffortStats(next), meterApi.getImportStatus()])
+    summary.value = nextSummary; series.value = nextSeries; stats.value = nextStats; importStatus.value = nextStatus
+  } catch (reason) { error.value = reason instanceof Error ? reason.message : String(reason) }
+  finally { loading.value = false }
 }
-
-async function toggleSource(source: SourceInfo) {
-  try {
-    const updated = await meterApi.updateSource(source.id, !source.enabled)
-    sources.value = sources.value.map(item => item.id === updated.id ? updated : item)
-    lastAction.value = `${updated.name} 已${updated.enabled ? '启用' : '停用'}`
-    await loadAll(true)
-  } catch (reason) { error.value = String(reason) }
-}
-
-async function runImport(force = false) {
-  try { importStatus.value = await meterApi.startImport(force); lastAction.value = force ? '已开始重建索引' : '已开始刷新' }
-  catch (reason) { error.value = String(reason) }
-}
-
-async function pauseImport() {
-  try { importStatus.value = await meterApi.pauseImport(); lastAction.value = '导入已暂停' }
-  catch (reason) { error.value = String(reason) }
-}
-
-async function toggleAutostart() {
-  try {
-    autostartEnabled.value = await meterApi.setAutostartEnabled(!autostartEnabled.value)
-    lastAction.value = `登录时启动已${autostartEnabled.value ? '开启' : '关闭'}`
-  } catch (reason) { error.value = String(reason) }
-}
-
-async function saveSettings(next: AppSettings, message?: string) {
-  try {
-    appSettings.value = await meterApi.updateAppSettings(next)
-    if (message) lastAction.value = message
-  } catch (reason) { error.value = String(reason) }
-}
-
-async function toggleMenuMetric(metric: keyof AppSettings['menuMetrics']) {
-  const enabled = !appSettings.value.menuMetrics[metric]
-  const next = cloneSettings(appSettings.value)
-  next.menuMetrics[metric] = enabled
-  const names = { todayTokens: '今日 Token', ttft: '首响时间', effectiveTps: '有效 TPS' }
-  await saveSettings(next, `${names[metric]}已${enabled ? '显示' : '隐藏'}`)
-}
-
-async function toggleAutomaticUpdates() {
-  const next = cloneSettings(appSettings.value)
-  next.updates.automaticCheck = !next.updates.automaticCheck
-  await saveSettings(next, `自动检查更新已${next.updates.automaticCheck ? '开启' : '关闭'}`)
-}
-
-async function checkForUpdates(silent = false) {
-  if (updateState.value.phase === 'checking' || updateState.value.phase === 'downloading') return
-  updateState.value = { ...updateState.value, phase: 'checking', error: undefined }
-  try {
-    updateState.value = await meterApi.checkForUpdate()
-    const next = cloneSettings(appSettings.value)
-    next.updates.lastCheckedAt = new Date().toISOString()
-    appSettings.value = await meterApi.updateAppSettings(next)
-    if (!silent && updateState.value.phase === 'current') lastAction.value = 'Agent Meter 已是最新版'
-  } catch (reason) {
-    updateState.value = { ...updateState.value, phase: 'error', error: reason instanceof Error ? reason.message : String(reason) }
-  }
-}
-
-async function downloadAndRestart() {
-  try {
-    await meterApi.downloadAndInstallUpdate(state => { updateState.value = state })
-  } catch (reason) {
-    updateState.value = { ...updateState.value, phase: 'error', error: reason instanceof Error ? reason.message : String(reason) }
-  }
-}
+async function saveSettings(next: AppSettings, message?: string) { try { appSettings.value = await meterApi.updateAppSettings(next); if (message) lastAction.value = message } catch (reason) { error.value = String(reason) } }
+async function selectPeriod(period: MetricPeriod) { filters.value.period = period; const next = cloneSettings(appSettings.value); next.menuPeriod = period; await saveSettings(next) }
+async function toggleMenuMetric(metric: keyof AppSettings['menuMetrics']) { const next = cloneSettings(appSettings.value); next.menuMetrics[metric] = !next.menuMetrics[metric]; const names = { todayTokens: '量', ttft: '首', effectiveTps: '速', estimatedCost: '费' }; await saveSettings(next, `${names[metric]}已${next.menuMetrics[metric] ? '显示' : '隐藏'}`) }
+async function toggleSource(source: SourceInfo) { try { const updated = await meterApi.updateSource(source.id, !source.enabled); sources.value = sources.value.map(item => item.id === updated.id ? updated : item); await loadAll(true) } catch (reason) { error.value = String(reason) } }
+async function runImport(force = false) { try { importStatus.value = await meterApi.startImport(force); lastAction.value = force ? '已开始重建索引' : '已开始同步' } catch (reason) { error.value = String(reason) } }
+async function pauseImport() { try { importStatus.value = await meterApi.pauseImport() } catch (reason) { error.value = String(reason) } }
+async function reprice() { try { pricing.value = await meterApi.repriceUsage(); await loadAll(true); lastAction.value = '已按当前价目重新计价' } catch (reason) { error.value = String(reason) } }
+async function toggleAutostart() { try { autostartEnabled.value = await meterApi.setAutostartEnabled(!autostartEnabled.value) } catch (reason) { error.value = String(reason) } }
+async function toggleAutomaticUpdates() { const next = cloneSettings(appSettings.value); next.updates.automaticCheck = !next.updates.automaticCheck; await saveSettings(next) }
+async function checkForUpdates(silent = false) { if (['checking', 'downloading'].includes(updateState.value.phase)) return; updateState.value = { ...updateState.value, phase: 'checking', error: undefined }; try { updateState.value = await meterApi.checkForUpdate(); const next = cloneSettings(appSettings.value); next.updates.lastCheckedAt = new Date().toISOString(); appSettings.value = await meterApi.updateAppSettings(next); if (!silent && updateState.value.phase === 'current') lastAction.value = 'Agent Meter 已是最新版' } catch (reason) { updateState.value = { ...updateState.value, phase: 'error', error: reason instanceof Error ? reason.message : String(reason) } } }
+async function downloadAndRestart() { try { await meterApi.downloadAndInstallUpdate(state => { updateState.value = state }) } catch (reason) { updateState.value = { ...updateState.value, phase: 'error', error: String(reason) } } }
 
 watch(filters, () => loadAll(), { deep: true })
-
 onMounted(async () => {
-  const [nextSources, nextAutostart, nextSettings, currentVersion] = await Promise.all([
-    meterApi.discoverSources(), meterApi.isAutostartEnabled(), meterApi.getAppSettings(), meterApi.getCurrentVersion(),
-  ])
-  sources.value = nextSources
-  autostartEnabled.value = nextAutostart
-  appSettings.value = nextSettings
-  updateState.value.currentVersion = currentVersion
+  const [nextSources, nextAutostart, nextSettings, nextPricing, currentVersion] = await Promise.all([meterApi.discoverSources(), meterApi.isAutostartEnabled(), meterApi.getAppSettings(), meterApi.getPricingCatalogStatus(), meterApi.getCurrentVersion()])
+  sources.value = nextSources; autostartEnabled.value = nextAutostart; appSettings.value = nextSettings; pricing.value = nextPricing; filters.value.period = nextSettings.menuPeriod; updateState.value.currentVersion = currentVersion
   await loadAll()
   unlisteners.push(await meterApi.on<ImportStatus>('import-progress', payload => { importStatus.value = payload }))
   unlisteners.push(await meterApi.on('metrics-updated', () => loadAll(true)))
   unlisteners.push(await meterApi.on<string>('source-error', payload => { error.value = payload }))
-  if (meterApi.isTauri()) {
-    updateDelay = setTimeout(() => { if (appSettings.value.updates.automaticCheck) void checkForUpdates(true) }, 15_000)
-    updateInterval = setInterval(() => { if (appSettings.value.updates.automaticCheck) void checkForUpdates(true) }, 86_400_000)
-  }
+  if (meterApi.isTauri()) { updateDelay = setTimeout(() => { if (appSettings.value.updates.automaticCheck) void checkForUpdates(true) }, 15_000); updateInterval = setInterval(() => { if (appSettings.value.updates.automaticCheck) void checkForUpdates(true) }, 86_400_000) }
 })
-onBeforeUnmount(() => {
-  unlisteners.splice(0).forEach(fn => fn())
-  if (updateDelay) clearTimeout(updateDelay)
-  if (updateInterval) clearInterval(updateInterval)
-})
+onBeforeUnmount(() => { unlisteners.splice(0).forEach(fn => fn()); if (updateDelay) clearTimeout(updateDelay); if (updateInterval) clearInterval(updateInterval) })
 </script>
 
 <template>
   <main class="app-shell">
     <header class="topbar">
-      <div class="brand">
-        <div class="brand-mark"><Activity :size="20" /></div>
-        <div><strong>Agent Meter</strong><span>本机 Agent 运行仪表盘</span></div>
-      </div>
-      <div class="header-actions">
-        <span class="freshness"><i :class="{ live: importStatus?.running }"></i>{{ importStatus?.running ? '正在索引' : `更新于 ${formatTime(overview?.lastUpdatedAt ?? null)}` }}</span>
-        <button class="icon-button" title="刷新数据" aria-label="刷新数据" @click="runImport(false)"><RefreshCw :size="18" :class="{ spin: importStatus?.running }" /></button>
-        <button class="icon-button" title="数据源设置" aria-label="打开数据源设置" @click="settingsOpen = true"><Settings :size="18" /></button>
-      </div>
+      <div class="brand"><div class="brand-mark"><Activity :size="20" /></div><div><strong>Agent Meter</strong><span>本机 Agent 四指标</span></div></div>
+      <div class="header-actions"><span class="freshness"><i :class="{ live: importStatus?.running }"></i>{{ importStatus?.running ? '正在同步' : `更新于 ${formatTime(summary?.lastUpdatedAt)}` }}</span><button class="icon-button" title="刷新数据" aria-label="刷新数据" @click="runImport(false)"><RefreshCw :size="18" :class="{ spin: importStatus?.running }" /></button><button class="icon-button" title="数据源设置" aria-label="打开数据源设置" @click="settingsOpen = true"><Settings :size="18" /></button></div>
     </header>
 
-    <section class="filters glass-panel" aria-label="统计筛选">
-      <label><span>日期范围</span><div class="date-range"><input v-model="filters.startDate" type="date"><span>至</span><input v-model="filters.endDate" type="date"></div></label>
-      <label><span>数据源</span><div class="select-wrap"><select v-model="filters.sourceId"><option :value="undefined">全部数据源</option><option v-for="source in sources" :key="source.id" :value="source.id">{{ source.name }}</option></select><ChevronDown :size="15" /></div></label>
+    <section class="control-band" aria-label="统计筛选">
+      <div class="period-control segmented"><button v-for="[key, label] in periods" :key="key" :class="{ active: filters.period === key }" @click="selectPeriod(key)">{{ label }}</button></div>
+      <label><span>来源</span><div class="select-wrap"><select v-model="filters.sourceId"><option :value="undefined">全部来源</option><option v-for="source in sources" :key="source.id" :value="source.id">{{ source.name }}</option></select><ChevronDown :size="15" /></div></label>
       <label><span>模型</span><div class="select-wrap"><select v-model="filters.model"><option value="">全部模型</option><option v-for="name in modelNames" :key="name">{{ name }}</option></select><ChevronDown :size="15" /></div></label>
-      <label><span>项目</span><div class="select-wrap"><select v-model="filters.project"><option value="">全部项目</option><option v-for="project in projects" :key="project">{{ project }}</option></select><ChevronDown :size="15" /></div></label>
-      <fieldset><legend>Agent 类型</legend><div class="segmented"><button v-for="item in ([['all','全部'],['root','主代理'],['subagent','子代理']] as [AgentKind,string][] )" :key="item[0]" :class="{ active: filters.agentKind === item[0] }" @click="filters.agentKind = item[0]">{{ item[1] }}</button></div></fieldset>
+      <label><span>推理强度</span><div class="select-wrap"><select v-model="filters.reasoningEffort"><option value="">全部强度</option><option v-for="effort in efforts" :key="effort" :value="effort">{{ effortName(effort) }}</option></select><ChevronDown :size="15" /></div></label>
     </section>
 
     <div v-if="error" class="notice error"><CircleAlert :size="18" />{{ error }}<button aria-label="关闭错误" @click="error = ''"><X :size="16" /></button></div>
     <div v-if="lastAction" class="notice success"><Check :size="18" />{{ lastAction }}<button aria-label="关闭提示" @click="lastAction = ''"><X :size="16" /></button></div>
 
-    <section class="kpi-grid" aria-label="今日总览">
-      <article class="kpi primary"><div class="kpi-icon"><Sparkles :size="19" /></div><span>Token 总量</span><strong>{{ overview ? formatCompact(overview.tokens.total) : '—' }}</strong><small>输入 {{ formatCompact(overview?.tokens.input ?? 0) }} · 输出 {{ formatCompact(overview?.tokens.output ?? 0) }}</small></article>
-      <article class="kpi"><div class="kpi-icon amber"><Gauge :size="19" /></div><span>近 5 轮首响</span><strong>{{ formatDuration(overview?.recentMedianTtftMs ?? null) }}</strong><small>P95 {{ formatDuration(overview?.p95TtftMs ?? null) }}</small></article>
-      <article class="kpi"><div class="kpi-icon green"><Activity :size="19" /></div><span class="with-tip">近 5 轮有效 TPS <i title="输出 Token ÷（整轮耗时 - 首响时间）。包含思考、工具等待和多次模型调用。">?</i></span><strong>{{ formatTps(overview?.recentMedianEffectiveTps ?? null) }}</strong><small>全期中位数 {{ formatTps(overview?.medianEffectiveTps ?? null) }}</small></article>
-      <article class="kpi"><div class="kpi-icon pink"><Users :size="19" /></div><span>任务轮次</span><strong>{{ overview?.turnCount ?? '—' }}</strong><small>{{ overview?.subagentCount ?? 0 }} 个子代理 · {{ overview?.runningCount ?? 0 }} 个运行中</small></article>
+    <section class="kpi-grid" aria-label="四大指标">
+      <article class="kpi speed"><div class="metric-code">速</div><span>{{ periodLabel }}平均有效 TPS</span><strong>{{ formatTps(summary?.averageEffectiveTps) }}</strong><small>{{ summary?.observationCount ?? 0 }} 次调用 · 仅有效完成记录</small></article>
+      <article class="kpi first"><div class="metric-code">首</div><span>{{ periodLabel }}平均首响</span><strong>{{ formatDuration(summary?.averageTtftMs) }}</strong><small>缺少首内容时间的记录不参与</small></article>
+      <article class="kpi volume"><div class="metric-code">量</div><span>{{ periodLabel }} Token 累计</span><strong>{{ formatCompact(summary?.tokens.total ?? 0) }}</strong><small>非缓存输入 + 缓存读写 + 输出</small></article>
+      <article class="kpi cost"><div class="metric-code">费</div><span>{{ periodLabel }} API 等价费用</span><strong>{{ formatCost(summary?.estimatedCostNanoUsd ?? 0, summary?.pricing.complete) }}</strong><small>USD · 计价覆盖 {{ pricedPercent }}%</small></article>
     </section>
 
     <section class="content-grid">
-      <article class="panel chart-panel">
-        <div class="panel-heading"><div><span class="eyebrow">TOKEN 趋势</span><h2>近 14 天用量</h2></div><div class="legend"><span><i class="dot indigo"></i>总 Token</span><span><i class="dot cyan"></i>输出</span></div></div>
-        <div v-if="loading" class="loading"><LoaderCircle class="spin" :size="22" />正在读取本机索引</div>
-        <div v-else class="chart-wrap">
-          <div class="axis"><span>{{ formatCompact(maxTokens) }}</span><span>{{ formatCompact(maxTokens / 2) }}</span><span>0</span></div>
-          <svg viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-label="Token 用量趋势折线图">
-            <defs><linearGradient id="area" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--accent)" stop-opacity=".32"/><stop offset="1" stop-color="var(--accent)" stop-opacity="0"/></linearGradient></defs>
-            <line v-for="y in [12,53,94]" :key="y" x1="0" :y1="y" x2="100" :y2="y" class="gridline" />
-            <polygon :points="chartArea" fill="url(#area)" />
-            <polyline :points="chartPoints" class="chart-line" />
-          </svg>
-          <div class="chart-labels"><span v-for="point in series.filter((_, i) => i % 3 === 0 || i === series.length - 1)" :key="point.bucket">{{ point.bucket.slice(5) }}</span></div>
-        </div>
-      </article>
-
-      <article class="panel breakdown-panel">
-        <div class="panel-heading"><div><span class="eyebrow">构成</span><h2>Token 明细</h2></div><span class="source-pill">{{ sourceSelected }}</span></div>
-        <div class="token-ring" :style="{ '--cached': `${overview ? overview.tokens.cachedInput / overview.tokens.total * 100 : 0}%`, '--input': `${overview ? overview.tokens.input / overview.tokens.total * 100 : 0}%`, '--output': `${overview ? (overview.tokens.input + overview.tokens.output) / overview.tokens.total * 100 : 0}%` }"><div><strong>{{ overview ? formatCompact(overview.tokens.total) : '—' }}</strong><span>总计</span></div></div>
-        <div class="breakdown-list">
-          <div><span><i class="dot indigo"></i>输入</span><strong>{{ formatCompact(overview?.tokens.input ?? 0) }}</strong></div>
-          <div><span><i class="dot cyan"></i>缓存输入</span><strong>{{ formatCompact(overview?.tokens.cachedInput ?? 0) }}</strong></div>
-          <div><span><i class="dot green"></i>输出</span><strong>{{ formatCompact(overview?.tokens.output ?? 0) }}</strong></div>
-          <div><span><i class="dot pink"></i>推理</span><strong>{{ formatCompact(overview?.tokens.reasoning ?? 0) }}</strong></div>
-        </div>
-        <p class="footnote">缓存输入是输入 Token 的子集，不重复计入总量。</p>
-      </article>
+      <article class="panel chart-panel"><div class="panel-heading"><div><span class="eyebrow">趋势</span><h2>{{ periodLabel }}用量走势</h2></div><span class="source-pill">{{ sourceName }}</span></div><div v-if="loading" class="loading"><LoaderCircle class="spin" :size="22" />正在读取本机指标</div><div v-else-if="!series.length" class="empty">当前筛选没有可用数据</div><div v-else class="chart-wrap"><div class="axis"><span>{{ formatCompact(maxSeries) }}</span><span>{{ formatCompact(maxSeries / 2) }}</span><span>0</span></div><svg viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-label="Token 用量趋势"><defs><linearGradient id="area" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--accent)" stop-opacity=".28"/><stop offset="1" stop-color="var(--accent)" stop-opacity="0"/></linearGradient></defs><line v-for="y in [12,52,92]" :key="y" x1="0" :y1="y" x2="100" :y2="y" class="gridline"/><polygon :points="chartArea" fill="url(#area)"/><polyline :points="chartPoints" class="chart-line"/></svg><div class="chart-labels"><span v-for="(point, index) in series" v-show="index % Math.max(1, Math.ceil(series.length / 5)) === 0 || index === series.length - 1" :key="point.bucket">{{ point.label }}</span></div></div></article>
+      <article class="panel breakdown-panel"><div class="panel-heading"><div><span class="eyebrow">TOKEN 构成</span><h2>互不重叠的计量桶</h2></div><BarChart3 :size="20" /></div><div class="breakdown-total"><strong>{{ formatCompact(summary?.tokens.total ?? 0) }}</strong><span>总 Token</span></div><div class="breakdown-list"><div><span><i class="dot blue"></i>非缓存输入</span><strong>{{ formatCompact(summary?.tokens.uncachedInput ?? 0) }}</strong></div><div><span><i class="dot cyan"></i>缓存读取</span><strong>{{ formatCompact(summary?.tokens.cachedRead ?? 0) }}</strong></div><div><span><i class="dot amber"></i>缓存写入</span><strong>{{ formatCompact(summary?.tokens.cachedWrite ?? 0) }}</strong></div><div><span><i class="dot green"></i>输出</span><strong>{{ formatCompact(summary?.tokens.output ?? 0) }}</strong></div><div class="subset"><span>其中推理 Token（输出子集）</span><strong>{{ formatCompact(summary?.tokens.reasoning ?? 0) }}</strong></div></div></article>
     </section>
 
-    <section class="panel table-panel">
-      <div class="panel-heading"><div><span class="eyebrow">效率对比</span><h2>模型表现</h2></div><span class="table-note">P50 / P95</span></div>
-      <div class="table-scroll"><table><thead><tr><th>模型</th><th>任务</th><th>Token</th><th>首响</th><th>整轮耗时</th><th><span class="with-tip">有效 TPS <i title="包含思考、工具等待和多次模型调用，不代表纯模型解码速度。">?</i></span></th></tr></thead><tbody><tr v-for="row in models" :key="`${row.model}-${row.reasoningEffort}`"><td><strong>{{ row.model }}</strong><small>{{ row.reasoningEffort || '默认推理' }}</small></td><td>{{ row.turnCount }}</td><td>{{ formatCompact(row.tokens.total) }}</td><td>{{ formatDuration(row.medianTtftMs) }}<small>{{ formatDuration(row.p95TtftMs) }}</small></td><td>{{ formatDuration(row.medianDurationMs) }}<small>{{ formatDuration(row.p95DurationMs) }}</small></td><td><strong>{{ formatTps(row.medianEffectiveTps) }}</strong></td></tr></tbody></table></div>
-    </section>
+    <section class="panel matrix-panel"><div class="panel-heading"><div><span class="eyebrow">核心分析</span><h2>来源 × 模型 × 推理强度</h2></div><span class="coverage"><i :class="{ partial: !summary?.pricing.complete }"></i>费用覆盖 {{ pricedPercent }}%</span></div><div class="table-scroll"><table><thead><tr><th>来源</th><th>模型 / Provider</th><th>推理强度</th><th>调用</th><th>速</th><th>首</th><th>量</th><th>费</th></tr></thead><tbody><tr v-for="row in stats" :key="`${row.sourceId}-${row.model}-${row.reasoningEffort}`"><td><span class="source-badge">{{ row.sourceName }}</span></td><td><strong>{{ row.model }}</strong><small>{{ row.provider }}</small></td><td><span class="effort-badge">{{ effortName(row.reasoningEffort) }}</span></td><td>{{ row.observationCount }}</td><td>{{ formatTps(row.averageEffectiveTps) }}</td><td>{{ formatDuration(row.averageTtftMs) }}</td><td>{{ formatCompact(row.tokens.total) }}</td><td><strong>{{ formatCost(row.estimatedCostNanoUsd, row.pricing.complete) }}</strong><small>{{ Math.round(row.pricing.ratio * 100) }}% 覆盖</small></td></tr><tr v-if="!stats.length"><td colspan="8"><div class="empty">当前筛选没有可用数据</div></td></tr></tbody></table></div></section>
 
-    <section class="lower-grid">
-      <article class="panel task-tree">
-        <div class="panel-heading"><div><span class="eyebrow">AGENT 结构</span><h2>主代理与子代理</h2></div><Bot :size="20" /></div>
-        <div class="tree-list">
-          <div v-for="root in rootTasks" :key="root.turnId" class="tree-group">
-            <div class="tree-row"><div class="agent-avatar"><Bot :size="17" /></div><div><strong>{{ root.project }}</strong><small>{{ root.model }} · {{ formatTime(root.startedAt) }}</small></div><span>{{ childCount(root.sessionId) }} 个子代理</span></div>
-            <div v-for="child in tasks.filter(task => task.parentThreadId === root.sessionId)" :key="child.turnId" class="tree-row child"><div class="branch">└</div><div class="agent-avatar sub"><Sparkles :size="15" /></div><div><strong>{{ child.agentPath?.split('/').pop() }}</strong><small>{{ child.model }} · {{ child.status === 'running' ? '运行中' : formatDuration(child.durationMs) }}</small></div><i class="status-dot" :class="child.status"></i></div>
-          </div>
-          <div v-if="!rootTasks.length" class="empty">当前筛选下没有主代理任务</div>
-        </div>
-      </article>
-
-      <article class="panel recent-tasks">
-        <div class="panel-heading"><div><span class="eyebrow">最近活动</span><h2>任务明细</h2></div><span>{{ tasks.length }} 条</span></div>
-        <div class="activity-list"><div v-for="task in tasks" :key="task.turnId" class="activity-row"><i class="status-dot" :class="task.status"></i><div><strong>{{ task.project || '未命名项目' }}</strong><small>{{ task.agentKind === 'root' ? '主代理' : '子代理' }} · {{ task.model }}</small></div><div class="activity-metric"><strong>{{ formatCompact(task.tokens.total) }}</strong><small>{{ formatDuration(task.durationMs) }}</small></div></div><div v-if="!tasks.length" class="empty">当前筛选下没有任务</div></div>
-      </article>
-    </section>
-
-    <div v-if="settingsOpen" class="drawer-backdrop" @click.self="settingsOpen = false">
-      <aside class="settings-drawer" aria-label="Agent Meter 设置">
-        <header><div><span class="eyebrow">设置</span><h2>Agent Meter 设置</h2></div><button class="icon-button" aria-label="关闭设置" title="关闭" @click="settingsOpen = false"><X :size="19" /></button></header>
-        <section><h3>菜单栏指标</h3><div class="settings-note">每项独立占一个位置；应用图标始终保留。</div><div class="source-row"><div class="source-icon"><PanelTop :size="18" /></div><div><strong>今日 Token</strong><small>紧凑显示为“量 1.2M”</small></div><button class="switch" :class="{ on: appSettings.menuMetrics.todayTokens }" role="switch" :aria-checked="appSettings.menuMetrics.todayTokens" aria-label="切换今日 Token 菜单栏指标" @click="toggleMenuMetric('todayTokens')"><i></i></button></div><div class="source-row"><div class="source-icon"><Gauge :size="18" /></div><div><strong>首响时间</strong><small>最近 5 个有效任务中位数，显示为“首 680ms”</small></div><button class="switch" :class="{ on: appSettings.menuMetrics.ttft }" role="switch" :aria-checked="appSettings.menuMetrics.ttft" aria-label="切换首响时间菜单栏指标" @click="toggleMenuMetric('ttft')"><i></i></button></div><div class="source-row"><div class="source-icon"><Activity :size="18" /></div><div><strong>有效 TPS</strong><small>最近 5 个有效任务中位数，显示为“速 16.4”</small></div><button class="switch" :class="{ on: appSettings.menuMetrics.effectiveTps }" role="switch" :aria-checked="appSettings.menuMetrics.effectiveTps" aria-label="切换有效 TPS 菜单栏指标" @click="toggleMenuMetric('effectiveTps')"><i></i></button></div></section>
-        <section><h3>本机数据源</h3><div v-for="source in sources" :key="source.id" class="source-row"><div class="source-icon"><Database :size="19" /></div><div><strong>{{ source.name }}</strong><small>{{ source.rootPath }} · {{ source.fileCount }} 个文件 · {{ formatBytes(source.totalBytes) }}</small><em v-if="source.error">{{ source.error }}</em></div><button class="switch" :class="{ on: source.enabled }" role="switch" :aria-checked="source.enabled" :aria-label="`${source.enabled ? '停用' : '启用'} ${source.name}`" @click="toggleSource(source)"><i></i></button></div></section>
-        <section><h3>索引状态</h3><div class="import-card"><div><strong>{{ importStatus?.message || '正在读取状态' }}</strong><span>{{ importStatus?.filesDone ?? 0 }} / {{ importStatus?.filesTotal ?? 0 }} 个文件</span></div><progress :value="importStatus?.bytesDone ?? 0" :max="importStatus?.bytesTotal || 1"></progress><small v-if="importStatus?.currentFile">{{ importStatus.currentFile }}</small><div class="import-actions"><button v-if="importStatus?.running" class="secondary-button" @click="pauseImport"><Pause :size="16" />暂停</button><button v-else class="secondary-button" @click="runImport(false)"><Play :size="16" />继续扫描</button><button class="danger-button" @click="runImport(true)"><RefreshCw :size="16" />重建索引</button></div></div></section>
-        <section><h3>应用</h3><div class="source-row"><div class="source-icon"><Play :size="19" /></div><div><strong>登录时启动</strong><small>默认关闭，可随时在这里启用。</small></div><button class="switch" :class="{ on: autostartEnabled }" role="switch" :aria-checked="autostartEnabled" aria-label="切换登录时启动" @click="toggleAutostart"><i></i></button></div></section>
-        <section><h3>软件更新</h3><div class="source-row"><div class="source-icon"><CloudDownload :size="19" /></div><div><strong>自动检查稳定版</strong><small>启动 15 秒后检查，之后每 24 小时检查。</small></div><button class="switch" :class="{ on: appSettings.updates.automaticCheck }" role="switch" :aria-checked="appSettings.updates.automaticCheck" aria-label="切换自动检查更新" @click="toggleAutomaticUpdates"><i></i></button></div><div class="update-card"><div class="update-heading"><div><strong>Agent Meter {{ updateState.currentVersion }}</strong><small v-if="appSettings.updates.lastCheckedAt">上次检查 {{ formatTime(appSettings.updates.lastCheckedAt) }}</small><small v-else>尚未检查更新</small></div><button class="secondary-button" :disabled="updateState.phase === 'checking' || updateState.phase === 'downloading'" @click="checkForUpdates(false)"><LoaderCircle v-if="updateState.phase === 'checking'" :size="15" class="spin" /><RefreshCw v-else :size="15" />检查更新</button></div><div v-if="updateState.phase === 'available'" class="update-available"><strong>发现 {{ updateState.version }}</strong><p v-if="updateState.notes">{{ updateState.notes }}</p><button class="primary-button" @click="downloadAndRestart"><CloudDownload :size="16" />下载并重启</button></div><div v-else-if="updateState.phase === 'downloading' || updateState.phase === 'ready'" class="update-download"><div><span>{{ updateState.phase === 'ready' ? '安装完成，正在重启' : '正在下载并验证' }}</span><span>{{ updateState.totalBytes ? `${Math.round(updateProgress)}%` : formatBytes(updateState.downloadedBytes) }}</span></div><progress :value="updateState.downloadedBytes" :max="updateState.totalBytes || Math.max(updateState.downloadedBytes, 1)"></progress></div><div v-else-if="updateState.phase === 'current'" class="update-message success-text"><Check :size="15" />已是最新版</div><div v-else-if="updateState.phase === 'error'" class="update-message error-text"><CircleAlert :size="15" />{{ updateState.error }}</div></div></section>
-        <section class="privacy-note"><Database :size="18" /><p><strong>数据始终留在本机</strong><span>只读取数值指标，不保存提示词、回复正文、工具参数或工具输出。</span></p></section>
-      </aside>
-    </div>
+    <div v-if="settingsOpen" class="drawer-backdrop" @click.self="settingsOpen = false"><aside class="settings-drawer" aria-label="Agent Meter 设置"><header><div><span class="eyebrow">设置</span><h2>Agent Meter 设置</h2></div><button class="icon-button" aria-label="关闭设置" title="关闭" @click="settingsOpen = false"><X :size="19" /></button></header>
+      <section><h3>菜单栏四指标</h3><p class="settings-note">每项固定为 38×22pt 上下两行，应用图标始终保留。四项共用下方周期。</p><div class="menu-period segmented"><button v-for="[key, label] in periods" :key="key" :class="{ active: appSettings.menuPeriod === key }" @click="selectPeriod(key)">{{ label }}</button></div>
+        <div v-for="item in ([['effectiveTps','速','平均有效 TPS',Zap],['ttft','首','平均首响时间',Timer],['todayTokens','量','Token 累加总量',Gauge],['estimatedCost','费','API 等价费用',Coins]] as const)" :key="item[0]" class="source-row"><div class="metric-mini">{{ item[1] }}</div><div><strong>{{ item[1] }} · {{ item[2] }}</strong><small>独立固定宽度状态项</small></div><button class="switch" :class="{ on: appSettings.menuMetrics[item[0]] }" role="switch" :aria-checked="appSettings.menuMetrics[item[0]]" :aria-label="`切换${item[1]}菜单栏指标`" @click="toggleMenuMetric(item[0])"><i></i></button></div>
+      </section>
+      <section><h3>本机只读数据源</h3><div v-for="source in sources" :key="source.id" class="source-row"><div class="source-icon"><Database :size="19" /></div><div><strong>{{ source.name }}</strong><small>{{ source.rootPath }} · {{ source.fileCount }} 个数据文件 · {{ formatBytes(source.totalBytes) }}</small><em v-if="source.error">{{ source.error }}</em></div><button class="switch" :class="{ on: source.enabled }" role="switch" :aria-checked="source.enabled" :aria-label="`${source.enabled ? '停用' : '启用'} ${source.name}`" @click="toggleSource(source)"><i></i></button></div></section>
+      <section><h3>索引与同步</h3><div class="settings-card"><div class="card-heading"><div><strong>{{ importStatus?.message || '正在读取状态' }}</strong><small>{{ importStatus?.filesDone ?? 0 }} / {{ importStatus?.filesTotal ?? 0 }} 个文件</small></div></div><progress :value="importStatus?.bytesDone ?? 0" :max="importStatus?.bytesTotal || 1"></progress><div class="button-row"><button v-if="importStatus?.running" class="secondary-button" @click="pauseImport"><Pause :size="16"/>暂停</button><button v-else class="secondary-button" @click="runImport(false)"><Play :size="16"/>继续同步</button><button class="danger-button" @click="runImport(true)"><RefreshCw :size="16"/>重建 Codex 索引</button></div></div></section>
+      <section><h3>API 等价价目</h3><div class="settings-card"><div class="card-heading"><div><strong>目录 {{ pricing?.version ?? '—' }}</strong><small>最后核验 {{ pricing?.verifiedAt ?? '—' }} · {{ pricing?.rates.length ?? 0 }} 个价格项</small></div><button class="secondary-button" @click="reprice"><Coins :size="15"/>重新计价</button></div><p class="settings-note pricing-note">按调用日期和官方标准文本 API 单价计算 USD 等价费用，不代表订阅套餐或实际账单。未知价格不会按零计入。</p><details><summary>查看价目与官方链接</summary><a v-for="rate in pricing?.rates" :key="`${rate.vendor}-${rate.model}`" :href="rate.sourceUrl" target="_blank" rel="noreferrer"><strong>{{ rate.model }}</strong><span>输入 ${{ rate.inputUsdPerMillion }} · 缓存读 {{ rate.cachedReadUsdPerMillion ?? '未公布' }} · 输出 ${{ rate.outputUsdPerMillion }} / 1M</span></a></details></div></section>
+      <section><h3>应用</h3><div class="source-row"><div class="source-icon"><Play :size="19"/></div><div><strong>登录时启动</strong><small>默认关闭</small></div><button class="switch" :class="{ on: autostartEnabled }" role="switch" :aria-checked="autostartEnabled" aria-label="切换登录时启动" @click="toggleAutostart"><i></i></button></div></section>
+      <section><h3>软件更新</h3><div class="source-row"><div class="source-icon"><CloudDownload :size="19"/></div><div><strong>自动检查稳定版</strong><small>启动后检查，之后每 24 小时检查</small></div><button class="switch" :class="{ on: appSettings.updates.automaticCheck }" role="switch" :aria-checked="appSettings.updates.automaticCheck" aria-label="切换自动检查更新" @click="toggleAutomaticUpdates"><i></i></button></div><div class="settings-card"><div class="card-heading"><div><strong>Agent Meter {{ updateState.currentVersion }}</strong><small>{{ appSettings.updates.lastCheckedAt ? `上次检查 ${formatTime(appSettings.updates.lastCheckedAt)}` : '尚未检查更新' }}</small></div><button class="secondary-button" :disabled="['checking','downloading'].includes(updateState.phase)" @click="checkForUpdates(false)"><LoaderCircle v-if="updateState.phase === 'checking'" :size="15" class="spin"/><RefreshCw v-else :size="15"/>检查更新</button></div><div v-if="updateState.phase === 'available'" class="update-result"><strong>发现 {{ updateState.version }}</strong><p>{{ updateState.notes }}</p><button class="primary-button" @click="downloadAndRestart"><CloudDownload :size="16"/>下载并重启</button></div><div v-else-if="updateState.phase === 'downloading' || updateState.phase === 'ready'" class="update-result"><span>{{ updateState.phase === 'ready' ? '安装完成，正在重启' : `正在下载并验证 ${Math.round(updateProgress)}%` }}</span><progress :value="updateState.downloadedBytes" :max="updateState.totalBytes || 1"></progress></div><div v-else-if="updateState.phase === 'current'" class="inline-result success-text"><Check :size="15"/>已是最新版</div><div v-else-if="updateState.phase === 'error'" class="inline-result error-text"><CircleAlert :size="15"/>{{ updateState.error }}</div></div></section>
+      <section class="privacy-note"><Info :size="18"/><p><strong>数据只留在本机</strong><span>只读数值指标，不保存对话、提示词、工具参数或工具输出。</span></p></section>
+    </aside></div>
   </main>
 </template>

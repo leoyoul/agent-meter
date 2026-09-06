@@ -36,7 +36,9 @@ jobs:
           tagName: v__VERSION__
           releaseName: Agent Meter v__VERSION__
           releaseBody: |
-            Agent Meter 是本地只读的非官方 Codex 辅助工具，不上传会话数据，也不估算金额。
+            Agent Meter v0.3.0 支持 Codex、ZCode 和 OpenCode，并以“速、首、量、费”统一展示本机调用。
+
+            数据源保持本地只读，不上传会话数据。“费”是按版本化官方标准文本 API 单价计算的 USD 等价费用，不代表订阅套餐或实际账单；未知价格会显示覆盖率，不按零处理。
 
             本版本提供 Apple Silicon DMG 和应用内更新包。DMG 尚未经过 Apple Developer ID 签名或 Apple 公证。
           releaseDraft: false

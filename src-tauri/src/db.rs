@@ -32,6 +32,7 @@ pub fn migrate(path: &Path) -> AppResult<()> {
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL,
             root_path TEXT NOT NULL UNIQUE,
+            source_kind TEXT NOT NULL DEFAULT 'codex_jsonl',
             enabled INTEGER NOT NULL DEFAULT 1,
             last_scan_at TEXT,
             error TEXT
@@ -109,8 +110,35 @@ pub fn migrate(path: &Path) -> AppResult<()> {
          CREATE INDEX IF NOT EXISTS idx_calls_kind ON model_calls(turn_id, call_kind);",
     )
     .map_err(to_error)?;
+    if !has_column(&conn, "sources", "source_kind")? {
+        conn.execute(
+            "ALTER TABLE sources ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'codex_jsonl'",
+            [],
+        )
+        .map_err(to_error)?;
+    }
     sync_known_sources(&conn)?;
-    Ok(())
+    conn.execute(
+        "UPDATE sources SET enabled=0 WHERE name IN ('Yodex','Lodex')",
+        [],
+    )
+    .map_err(to_error)?;
+    crate::analytics::migrate(&conn)
+}
+
+fn has_column(conn: &Connection, table: &str, column: &str) -> AppResult<bool> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(to_error)?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(to_error)?;
+    for name in names {
+        if name.map_err(to_error)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub fn reset_index(path: &Path) -> AppResult<()> {
@@ -121,31 +149,41 @@ pub fn reset_index(path: &Path) -> AppResult<()> {
          DELETE FROM turns;
          DELETE FROM sessions;
          DELETE FROM scan_files;
+         DELETE FROM usage_observations;
+         DELETE FROM source_sync_cursors;
          UPDATE sources SET last_scan_at=NULL, error=NULL;
          COMMIT;",
     )
     .map_err(to_error)
 }
 
-fn known_source_paths() -> Vec<(String, PathBuf)> {
+fn known_source_paths() -> Vec<(String, PathBuf, &'static str)> {
     let Some(home) = dirs::home_dir() else {
         return Vec::new();
     };
     vec![
-        ("Codex".into(), home.join(".codex")),
-        ("Yodex".into(), home.join(".yodex")),
-        ("Lodex".into(), home.join(".lodex")),
+        ("Codex".into(), home.join(".codex"), "codex_jsonl"),
+        (
+            "ZCode".into(),
+            home.join(".zcode/cli/db/db.sqlite"),
+            "zcode_sqlite",
+        ),
+        (
+            "OpenCode".into(),
+            home.join(".local/share/opencode/opencode.db"),
+            "opencode_sqlite",
+        ),
     ]
 }
 
 pub fn sync_known_sources(conn: &Connection) -> AppResult<()> {
-    for (name, path) in known_source_paths() {
+    for (name, path, source_kind) in known_source_paths() {
         if path.exists() {
             conn.execute(
-                "INSERT INTO sources(name, root_path, enabled)
-                 VALUES (?1, ?2, 1)
-                 ON CONFLICT(root_path) DO UPDATE SET name=excluded.name",
-                params![name, path.to_string_lossy()],
+                "INSERT INTO sources(name, root_path, source_kind, enabled)
+                 VALUES (?1, ?2, ?3, 1)
+                 ON CONFLICT(root_path) DO UPDATE SET name=excluded.name,source_kind=excluded.source_kind",
+                params![name, path.to_string_lossy(), source_kind],
             )
             .map_err(to_error)?;
         }
@@ -158,8 +196,8 @@ pub fn discover_sources(path: &Path) -> AppResult<Vec<SourceInfo>> {
     sync_known_sources(&conn)?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, name, root_path, enabled, last_scan_at, error
-             FROM sources ORDER BY id",
+            "SELECT id, name, root_path, source_kind, enabled, last_scan_at, error
+             FROM sources WHERE name NOT IN ('Yodex','Lodex') ORDER BY id",
         )
         .map_err(to_error)?;
     let rows = stmt
@@ -168,17 +206,30 @@ pub fn discover_sources(path: &Path) -> AppResult<Vec<SourceInfo>> {
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, bool>(3)?,
-                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, bool>(4)?,
                 row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
             ))
         })
         .map_err(to_error)?;
     let mut result = Vec::new();
     for row in rows {
-        let (id, name, root_path, enabled, last_scan_at, error) = row.map_err(to_error)?;
-        let available = Path::new(&root_path).is_dir();
-        let (file_count, total_bytes) = source_inventory(Path::new(&root_path));
+        let (id, name, root_path, source_kind, enabled, last_scan_at, error) =
+            row.map_err(to_error)?;
+        let source_path = Path::new(&root_path);
+        let available = if source_kind == "codex_jsonl" {
+            source_path.is_dir()
+        } else {
+            source_path.is_file()
+        };
+        let (file_count, total_bytes) = if source_kind == "codex_jsonl" {
+            source_inventory(source_path)
+        } else if let Ok(metadata) = source_path.metadata() {
+            (1, metadata.len())
+        } else {
+            (0, 0)
+        };
         result.push(SourceInfo {
             id,
             name,
@@ -220,7 +271,10 @@ pub fn is_rollout(path: &Path) -> bool {
 pub fn enabled_sources(path: &Path) -> AppResult<Vec<(i64, PathBuf)>> {
     let conn = open(path)?;
     let mut stmt = conn
-        .prepare("SELECT id, root_path FROM sources WHERE enabled=1 ORDER BY id")
+        .prepare(
+            "SELECT id, root_path FROM sources
+             WHERE enabled=1 AND source_kind='codex_jsonl' ORDER BY id",
+        )
         .map_err(to_error)?;
     let rows = stmt
         .query_map([], |row| {

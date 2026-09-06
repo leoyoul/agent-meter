@@ -1,7 +1,7 @@
 [package]
 name = "agent-meter"
-version = "0.2.0"
-description = "Local Codex usage and performance monitor"
+version = "0.3.0"
+description = "Local Agent usage, performance, and API-equivalent cost monitor"
 authors = ["LeoY"]
 edition = "2021"
 license = "MIT"
@@ -22,6 +22,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
+ab_glyph = "0.2"
 notify = "8"
 parking_lot = "0.12"
 rusqlite = { version = "0.37", features = ["bundled"] }

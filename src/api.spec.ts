@@ -1,54 +1,46 @@
 import { describe, expect, it } from 'vitest'
 import { meterApi } from './api'
 
-describe('browser mock API', () => {
-  it('returns complete dashboard data without a Tauri runtime', async () => {
-    expect(meterApi.isTauri()).toBe(false)
-    const [overview, series, models, tasks] = await Promise.all([
-      meterApi.queryOverview({ agentKind: 'all' }),
-      meterApi.queryTimeseries({}),
-      meterApi.queryModelStats({}),
-      meterApi.queryTasks({}),
-    ])
-
-    expect(overview.tokens.total).toBeGreaterThan(0)
-    expect(series).toHaveLength(14)
-    expect(models.length).toBeGreaterThanOrEqual(3)
-    expect(tasks.some(task => task.agentKind === 'subagent')).toBe(true)
+describe('browser mock API v0.3', () => {
+  it('returns the four-metric contract', async () => {
+    const filters = { period: 'realtime' as const }
+    const [summary, series, matrix] = await Promise.all([meterApi.queryMetricSummary(filters), meterApi.queryMetricSeries(filters), meterApi.queryModelEffortStats(filters)])
+    expect(summary.tokens.total).toBeGreaterThan(0)
+    expect(summary.averageTtftMs).toBeGreaterThan(0)
+    expect(summary.averageEffectiveTps).toBeGreaterThan(0)
+    expect(summary.estimatedCostNanoUsd).toBeGreaterThan(0)
+    expect(series).toHaveLength(10)
+    expect(new Set(matrix.map(row => row.sourceName))).toEqual(new Set(['Codex', 'ZCode', 'OpenCode']))
   })
 
-  it('applies task filters and updates source state', async () => {
-    const fastTasks = await meterApi.queryTasks({ model: 'codex-fast', agentKind: 'subagent' })
-    expect(fastTasks).toHaveLength(1)
-    expect(fastTasks[0].agentKind).toBe('subagent')
-
-    const [source] = await meterApi.discoverSources()
-    const updated = await meterApi.updateSource(source.id, false)
-    expect(updated.enabled).toBe(false)
-    await meterApi.updateSource(source.id, true)
+  it('filters by source, model and effort', async () => {
+    const rows = await meterApi.queryModelEffortStats({ period: 'today', sourceId: 2, model: 'Qwen3.8-27B-MLX-4bit', reasoningEffort: 'default' })
+    expect(rows).toHaveLength(1)
+    expect(rows[0].sourceName).toBe('ZCode')
+    expect(rows[0].estimatedCostNanoUsd).toBe(0)
+    expect(rows[0].pricing.complete).toBe(true)
   })
 
-  it('supports import lifecycle actions', async () => {
-    const started = await meterApi.startImport(true)
-    expect(started.running).toBe(true)
-    expect(started.message).toContain('重建')
-
-    const paused = await meterApi.pauseImport()
-    expect(paused.paused).toBe(true)
-    expect(paused.running).toBe(false)
+  it('exposes versioned official pricing metadata', async () => {
+    const catalog = await meterApi.getPricingCatalogStatus()
+    expect(catalog.version).toMatch(/^\d{4}-\d{2}-\d{2}/)
+    expect(catalog.rates.every(rate => rate.sourceUrl.startsWith('https://'))).toBe(true)
   })
 
-  it('persists menu settings in the browser adapter', async () => {
+  it('persists fee visibility and shared period', async () => {
     const settings = await meterApi.getAppSettings()
-    settings.menuMetrics.ttft = true
+    settings.menuMetrics.estimatedCost = true
+    settings.menuPeriod = 'year'
     const updated = await meterApi.updateAppSettings(settings)
-    expect(updated.menuMetrics.ttft).toBe(true)
-    expect((await meterApi.getAppSettings()).menuMetrics.ttft).toBe(true)
+    expect(updated.menuMetrics.estimatedCost).toBe(true)
+    expect(updated.menuPeriod).toBe('year')
   })
 
-  it('reports the current version when no mock update exists', async () => {
-    const update = await meterApi.checkForUpdate()
-    expect(update.phase).toBe('current')
-    expect(update.currentVersion).toBe('0.2.0')
+  it('supports source and import lifecycle controls', async () => {
+    const [source] = await meterApi.discoverSources()
+    expect((await meterApi.updateSource(source.id, false)).enabled).toBe(false)
+    await meterApi.updateSource(source.id, true)
+    expect((await meterApi.startImport(true)).message).toContain('重建')
+    expect((await meterApi.pauseImport()).paused).toBe(true)
   })
 })

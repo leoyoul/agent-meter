@@ -173,6 +173,8 @@ fn run_import(app: &AppHandle, state: &BackendState) -> AppResult<()> {
         params![now],
     )
     .map_err(db::to_error)?;
+    drop(conn);
+    crate::analytics::sync_all_sources(&state.db_path)?;
     Ok(())
 }
 

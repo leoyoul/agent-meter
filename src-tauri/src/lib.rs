@@ -1,12 +1,15 @@
+mod analytics;
 mod db;
 mod importer;
+mod metric_icon;
 mod models;
 mod settings;
 
-use chrono::Local;
 use importer::BackendState;
 use models::{
-    ImportStatus, MetricFilters, ModelStat, Overview, SourceInfo, TaskRow, TimeseriesPoint,
+    AnalyticsFilters, ImportStatus, MetricFilters, MetricSeriesPoint, MetricSummary,
+    ModelEffortStat, ModelStat, Overview, PricingCatalogStatus, SourceInfo, TaskRow,
+    TimeseriesPoint,
 };
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use settings::{AppSettings, SettingsState};
@@ -81,6 +84,42 @@ fn query_tasks(
     db::query_tasks(&state.db_path, filters.unwrap_or_default(), limit)
 }
 
+#[tauri::command]
+fn query_metric_summary(
+    state: State<'_, BackendState>,
+    filters: Option<AnalyticsFilters>,
+) -> Result<MetricSummary, String> {
+    analytics::query_metric_summary(&state.db_path, filters.unwrap_or_default())
+}
+
+#[tauri::command]
+fn query_metric_series(
+    state: State<'_, BackendState>,
+    filters: Option<AnalyticsFilters>,
+) -> Result<Vec<MetricSeriesPoint>, String> {
+    analytics::query_metric_series(&state.db_path, filters.unwrap_or_default())
+}
+
+#[tauri::command]
+fn query_model_effort_stats(
+    state: State<'_, BackendState>,
+    filters: Option<AnalyticsFilters>,
+) -> Result<Vec<ModelEffortStat>, String> {
+    analytics::query_model_effort_stats(&state.db_path, filters.unwrap_or_default())
+}
+
+#[tauri::command]
+fn get_pricing_catalog_status(
+    state: State<'_, BackendState>,
+) -> Result<PricingCatalogStatus, String> {
+    analytics::pricing_catalog_status(&state.db_path)
+}
+
+#[tauri::command]
+fn reprice_usage(state: State<'_, BackendState>) -> Result<PricingCatalogStatus, String> {
+    analytics::reprice_usage(&state.db_path)
+}
+
 #[tauri::command(rename_all = "camelCase")]
 fn update_source(
     state: State<'_, BackendState>,
@@ -126,7 +165,8 @@ fn tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
 fn build_metric_tray(app: &AppHandle, id: &str, title: &str, tooltip: &str) -> tauri::Result<()> {
     let menu = tray_menu(app)?;
     TrayIconBuilder::with_id(id)
-        .title(title)
+        .icon(metric_icon::render(title, "--"))
+        .icon_as_template(true)
         .tooltip(tooltip)
         .menu(&menu)
         .show_menu_on_left_click(false)
@@ -162,25 +202,26 @@ fn sync_metric_trays(app: &AppHandle, settings: &AppSettings) -> Result<(), Stri
 
 fn metric_tray_specs(
     settings: &AppSettings,
-) -> [(&'static str, bool, &'static str, &'static str); 3] {
+) -> [(&'static str, bool, &'static str, &'static str); 4] {
     [
         (
             "metric-tokens",
             settings.menu_metrics.today_tokens,
-            "量 --",
-            "今日 Token",
+            "量",
+            "Token 总量",
         ),
-        (
-            "metric-ttft",
-            settings.menu_metrics.ttft,
-            "首 --",
-            "最近 5 个有效任务的首响中位数",
-        ),
+        ("metric-ttft", settings.menu_metrics.ttft, "首", "平均首响"),
         (
             "metric-tps",
             settings.menu_metrics.effective_tps,
-            "速 --",
-            "最近 5 个有效任务的有效 TPS 中位数",
+            "速",
+            "平均有效 TPS",
+        ),
+        (
+            "metric-cost",
+            settings.menu_metrics.estimated_cost,
+            "费",
+            "API 等价费用（USD）",
         ),
     ]
 }
@@ -226,20 +267,19 @@ fn setup_trays(app: &tauri::App, settings: &AppSettings) -> tauri::Result<()> {
 }
 
 fn update_tray_titles(app: &AppHandle, state: &BackendState) {
-    let today = Local::now().format("%Y-%m-%d").to_string();
-    let filters = MetricFilters {
-        start_date: Some(today.clone()),
-        end_date: Some(today),
-        ..MetricFilters::default()
-    };
-    let Ok(today_overview) = db::query_overview(&state.db_path, filters) else {
+    let settings = app.state::<SettingsState>().load();
+    let Ok(summary) = analytics::query_metric_summary(
+        &state.db_path,
+        AnalyticsFilters {
+            period: settings.menu_period,
+            ..AnalyticsFilters::default()
+        },
+    ) else {
         return;
     };
-    let recent_overview = db::query_overview(&state.db_path, MetricFilters::default()).ok();
-    let token = compact_number(today_overview.tokens.total);
-    let ttft = recent_overview
-        .as_ref()
-        .and_then(|overview| overview.recent_median_ttft_ms)
+    let token = compact_number(summary.tokens.total);
+    let ttft = summary
+        .average_ttft_ms
         .map(|value| {
             if value >= 1000.0 {
                 format!("{:.1}s", value / 1000.0)
@@ -248,19 +288,58 @@ fn update_tray_titles(app: &AppHandle, state: &BackendState) {
             }
         })
         .unwrap_or_else(|| "--".into());
-    let tps = recent_overview
-        .as_ref()
-        .and_then(|overview| overview.recent_median_effective_tps)
+    let tps = summary
+        .average_effective_tps
         .map(|value| format!("{value:.1}"))
         .unwrap_or_else(|| "--".into());
+    let cost = compact_cost(summary.estimated_cost_nano_usd, summary.pricing.complete);
+    let period = period_name(settings.menu_period);
     if let Some(tray) = app.tray_by_id("metric-tokens") {
-        let _ = tray.set_title(Some(format!("量 {token}")));
+        let _ = tray.set_icon_with_as_template(Some(metric_icon::render("量", &token)), true);
+        let _ = tray.set_tooltip(Some(format!("{period} Token 总量 {token}")));
     }
     if let Some(tray) = app.tray_by_id("metric-ttft") {
-        let _ = tray.set_title(Some(format!("首 {ttft}")));
+        let _ = tray.set_icon_with_as_template(Some(metric_icon::render("首", &ttft)), true);
+        let _ = tray.set_tooltip(Some(format!("{period}平均首响 {ttft}")));
     }
     if let Some(tray) = app.tray_by_id("metric-tps") {
-        let _ = tray.set_title(Some(format!("速 {tps}")));
+        let _ = tray.set_icon_with_as_template(Some(metric_icon::render("速", &tps)), true);
+        let _ = tray.set_tooltip(Some(format!("{period}平均有效 TPS {tps}")));
+    }
+    if let Some(tray) = app.tray_by_id("metric-cost") {
+        let _ = tray.set_icon_with_as_template(Some(metric_icon::render("费", &cost)), true);
+        let _ = tray.set_tooltip(Some(format!(
+            "{period} API 等价费用 {cost} · 计价覆盖 {:.0}%",
+            summary.pricing.ratio * 100.0
+        )));
+    }
+}
+
+fn period_name(period: models::MetricPeriod) -> &'static str {
+    match period {
+        models::MetricPeriod::Realtime => "最近 10 次",
+        models::MetricPeriod::Today => "今日",
+        models::MetricPeriod::Week => "本周",
+        models::MetricPeriod::Month => "本月",
+        models::MetricPeriod::Year => "本年",
+    }
+}
+
+fn compact_cost(nano_usd: i64, complete: bool) -> String {
+    let usd = nano_usd as f64 / 1_000_000_000.0;
+    let value = if usd >= 1_000.0 {
+        format!("${:.1}K", usd / 1_000.0)
+    } else if usd >= 10.0 {
+        format!("${usd:.0}")
+    } else if usd >= 1.0 {
+        format!("${usd:.1}")
+    } else {
+        format!("${usd:.2}")
+    };
+    if complete {
+        value
+    } else {
+        format!("{value}+")
     }
 }
 
@@ -298,7 +377,7 @@ fn begin_background_loop(app: AppHandle, state: BackendState) {
         importer::start_background_import(app.clone(), state.clone());
 
         loop {
-            let should_scan = match rx.recv_timeout(Duration::from_secs(30)) {
+            let should_scan = match rx.recv_timeout(Duration::from_secs(5)) {
                 Ok(Ok(event)) => event.paths.iter().any(|path| db::is_rollout(path)),
                 Ok(Err(error)) => {
                     use tauri::Emitter;
@@ -378,6 +457,11 @@ pub fn run() {
             query_timeseries,
             query_model_stats,
             query_tasks,
+            query_metric_summary,
+            query_metric_series,
+            query_model_effort_stats,
+            get_pricing_catalog_status,
+            reprice_usage,
             update_source,
             get_app_settings,
             update_app_settings
@@ -406,11 +490,12 @@ mod tests {
 
     #[test]
     fn every_metric_visibility_combination_is_independent() {
-        for bits in 0_u8..8 {
+        for bits in 0_u8..16 {
             let mut settings = AppSettings::default();
             settings.menu_metrics.today_tokens = bits & 1 != 0;
             settings.menu_metrics.ttft = bits & 2 != 0;
             settings.menu_metrics.effective_tps = bits & 4 != 0;
+            settings.menu_metrics.estimated_cost = bits & 8 != 0;
             let enabled = metric_tray_specs(&settings)
                 .into_iter()
                 .filter(|(_, visible, _, _)| *visible)
@@ -420,6 +505,7 @@ mod tests {
             assert_eq!(enabled.contains(&"metric-tokens"), bits & 1 != 0);
             assert_eq!(enabled.contains(&"metric-ttft"), bits & 2 != 0);
             assert_eq!(enabled.contains(&"metric-tps"), bits & 4 != 0);
+            assert_eq!(enabled.contains(&"metric-cost"), bits & 8 != 0);
         }
     }
 

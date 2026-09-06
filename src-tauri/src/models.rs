@@ -12,6 +12,118 @@ pub struct MetricFilters {
     pub agent_kind: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum MetricPeriod {
+    #[default]
+    Realtime,
+    Today,
+    Week,
+    Month,
+    Year,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalyticsFilters {
+    #[serde(default)]
+    pub period: MetricPeriod,
+    pub source_id: Option<i64>,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageTokens {
+    pub uncached_input: i64,
+    pub cached_read: i64,
+    pub cached_write: i64,
+    pub output: i64,
+    pub reasoning: i64,
+    pub total: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PricingCoverage {
+    pub priced_observations: i64,
+    pub total_observations: i64,
+    pub priced_tokens: i64,
+    pub total_tokens: i64,
+    pub ratio: f64,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricSummary {
+    pub period: MetricPeriod,
+    pub observation_count: i64,
+    pub average_ttft_ms: Option<f64>,
+    pub average_effective_tps: Option<f64>,
+    pub tokens: UsageTokens,
+    pub estimated_cost_nano_usd: i64,
+    pub pricing: PricingCoverage,
+    pub last_updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricSeriesPoint {
+    pub bucket: String,
+    pub label: String,
+    pub observation_count: i64,
+    pub average_ttft_ms: Option<f64>,
+    pub average_effective_tps: Option<f64>,
+    pub total_tokens: i64,
+    pub estimated_cost_nano_usd: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelEffortStat {
+    pub source_id: i64,
+    pub source_name: String,
+    pub provider: String,
+    pub model: String,
+    pub reasoning_effort: String,
+    pub observation_count: i64,
+    pub average_ttft_ms: Option<f64>,
+    pub average_effective_tps: Option<f64>,
+    pub tokens: UsageTokens,
+    pub estimated_cost_nano_usd: i64,
+    pub pricing: PricingCoverage,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PricingRate {
+    pub vendor: String,
+    pub model: String,
+    pub aliases: Vec<String>,
+    pub currency: String,
+    pub input_usd_per_million: String,
+    pub cached_read_usd_per_million: Option<String>,
+    pub cached_write_usd_per_million: Option<String>,
+    pub output_usd_per_million: String,
+    pub effective_from: String,
+    pub effective_to: Option<String>,
+    pub source_url: String,
+    pub verified_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PricingCatalogStatus {
+    pub version: String,
+    pub currency: String,
+    pub verified_at: String,
+    pub rates: Vec<PricingRate>,
+    pub priced_observations: i64,
+    pub total_observations: i64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceInfo {

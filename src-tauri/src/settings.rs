@@ -11,6 +11,8 @@ pub struct MenuMetrics {
     pub ttft: bool,
     #[serde(default)]
     pub effective_tps: bool,
+    #[serde(default)]
+    pub estimated_cost: bool,
 }
 
 impl Default for MenuMetrics {
@@ -19,6 +21,7 @@ impl Default for MenuMetrics {
             today_tokens: true,
             ttft: false,
             effective_tps: false,
+            estimated_cost: false,
         }
     }
 }
@@ -46,6 +49,8 @@ impl Default for UpdateSettings {
 pub struct AppSettings {
     #[serde(default)]
     pub menu_metrics: MenuMetrics,
+    #[serde(default)]
+    pub menu_period: crate::models::MetricPeriod,
     #[serde(default)]
     pub updates: UpdateSettings,
 }
@@ -109,6 +114,8 @@ mod tests {
         assert!(settings.menu_metrics.today_tokens);
         assert!(!settings.menu_metrics.ttft);
         assert!(!settings.menu_metrics.effective_tps);
+        assert!(!settings.menu_metrics.estimated_cost);
+        assert_eq!(settings.menu_period, crate::models::MetricPeriod::Realtime);
         assert!(settings.updates.automatic_check);
     }
 
