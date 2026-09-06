@@ -78,7 +78,12 @@ mod tests {
             let image = render(label, value);
             assert_eq!(image.width(), WIDTH as u32);
             assert_eq!(image.height(), HEIGHT as u32);
-            assert!(image.rgba().chunks_exact(4).any(|pixel| pixel[3] > 0));
+            assert!(image
+                .rgba()
+                .iter()
+                .skip(3)
+                .step_by(4)
+                .any(|alpha| *alpha > 0));
         }
     }
 }

@@ -926,7 +926,7 @@ pub fn query_model_effort_stats(
             },
         )
         .collect::<Vec<_>>();
-    result.sort_by(|a, b| b.tokens.total.cmp(&a.tokens.total));
+    result.sort_by_key(|row| std::cmp::Reverse(row.tokens.total));
     Ok(result)
 }
 
