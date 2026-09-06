@@ -37,4 +37,18 @@ describe('browser mock API', () => {
     expect(paused.paused).toBe(true)
     expect(paused.running).toBe(false)
   })
+
+  it('persists menu settings in the browser adapter', async () => {
+    const settings = await meterApi.getAppSettings()
+    settings.menuMetrics.ttft = true
+    const updated = await meterApi.updateAppSettings(settings)
+    expect(updated.menuMetrics.ttft).toBe(true)
+    expect((await meterApi.getAppSettings()).menuMetrics.ttft).toBe(true)
+  })
+
+  it('reports the current version when no mock update exists', async () => {
+    const update = await meterApi.checkForUpdate()
+    expect(update.phase).toBe('current')
+    expect(update.currentVersion).toBe('0.2.0')
+  })
 })

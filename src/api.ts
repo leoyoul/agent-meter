@@ -1,7 +1,12 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { getVersion } from '@tauri-apps/api/app'
 import { disable, enable, isEnabled } from '@tauri-apps/plugin-autostart'
+import { relaunch } from '@tauri-apps/plugin-process'
+import { check, type Update } from '@tauri-apps/plugin-updater'
 import type {
+  AppSettings,
+  AppUpdateState,
   ImportStatus,
   MetricFilters,
   ModelStat,
@@ -51,6 +56,13 @@ const timeseries: TimeseriesPoint[] = Array.from({ length: 14 }, (_, i) => {
 
 let mockStatus: ImportStatus = { running: false, paused: false, filesDone: 546, filesTotal: 546, bytesDone: 2_577_980_416, bytesTotal: 2_577_980_416, currentFile: null, startedAt: iso(-48), message: '索引已是最新' }
 let mockAutostart = false
+let mockSettings: AppSettings = {
+  menuMetrics: { todayTokens: true, ttft: false, effectiveTps: false },
+  updates: { automaticCheck: true, lastCheckedAt: null },
+}
+let pendingUpdate: Update | null = null
+
+const mockHasUpdate = () => typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('update') === 'available'
 
 const call = async <T>(command: string, args?: Record<string, unknown>, fallback?: () => T): Promise<T> => {
   if (isTauri()) return invoke<T>(command, args)
@@ -87,6 +99,52 @@ export const meterApi = {
     source.enabled = enabled
     return { ...source }
   }),
+  getAppSettings: () => call<AppSettings>('get_app_settings', undefined, () => structuredClone(mockSettings)),
+  updateAppSettings: (settings: AppSettings) => call<AppSettings>('update_app_settings', { settings }, () => {
+    mockSettings = structuredClone(settings)
+    return structuredClone(mockSettings)
+  }),
+  getCurrentVersion: async () => isTauri() ? getVersion() : '0.2.0',
+  checkForUpdate: async (): Promise<AppUpdateState> => {
+    const currentVersion = await meterApi.getCurrentVersion()
+    if (!isTauri()) {
+      await new Promise(resolve => setTimeout(resolve, 180))
+      return mockHasUpdate()
+        ? { phase: 'available', currentVersion, version: '0.2.1', notes: '改进菜单栏显示和更新体验。', downloadedBytes: 0 }
+        : { phase: 'current', currentVersion, downloadedBytes: 0 }
+    }
+    if (pendingUpdate) {
+      await pendingUpdate.close()
+      pendingUpdate = null
+    }
+    const update = await check({ timeout: 20_000 })
+    if (!update) return { phase: 'current', currentVersion, downloadedBytes: 0 }
+    pendingUpdate = update
+    return { phase: 'available', currentVersion, version: update.version, notes: update.body, downloadedBytes: 0 }
+  },
+  downloadAndInstallUpdate: async (onState: (state: AppUpdateState) => void) => {
+    const currentVersion = await meterApi.getCurrentVersion()
+    if (!isTauri()) {
+      const totalBytes = 8_000_000
+      onState({ phase: 'downloading', currentVersion, version: '0.2.1', downloadedBytes: 3_200_000, totalBytes })
+      await new Promise(resolve => setTimeout(resolve, 120))
+      onState({ phase: 'ready', currentVersion, version: '0.2.1', downloadedBytes: totalBytes, totalBytes })
+      return
+    }
+    if (!pendingUpdate) throw new Error('没有可安装的更新，请先检查更新')
+    const update = pendingUpdate
+    let downloadedBytes = 0
+    let totalBytes: number | undefined
+    await update.download(event => {
+      if (event.event === 'Started') totalBytes = event.data.contentLength
+      if (event.event === 'Progress') downloadedBytes += event.data.chunkLength
+      onState({ phase: 'downloading', currentVersion, version: update.version, notes: update.body, downloadedBytes, totalBytes })
+    }, { timeout: 120_000 })
+    await meterApi.pauseImport()
+    await update.install()
+    onState({ phase: 'ready', currentVersion, version: update.version, notes: update.body, downloadedBytes, totalBytes })
+    await relaunch()
+  },
   isAutostartEnabled: async () => isTauri() ? isEnabled() : mockAutostart,
   setAutostartEnabled: async (enabled: boolean) => {
     if (isTauri()) enabled ? await enable() : await disable()

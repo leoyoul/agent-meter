@@ -3,5 +3,5 @@
   "identifier": "main-capability",
   "description": "Agent Meter main window permissions",
   "windows": ["main"],
-  "permissions": ["core:default", "autostart:default"]
+  "permissions": ["core:default", "autostart:default", "updater:default", "process:allow-restart"]
 }

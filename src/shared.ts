@@ -1,5 +1,29 @@
 export type AgentKind = 'all' | 'root' | 'subagent'
 
+export interface AppSettings {
+  menuMetrics: {
+    todayTokens: boolean
+    ttft: boolean
+    effectiveTps: boolean
+  }
+  updates: {
+    automaticCheck: boolean
+    lastCheckedAt?: string | null
+  }
+}
+
+export type UpdatePhase = 'idle' | 'checking' | 'available' | 'current' | 'downloading' | 'ready' | 'error'
+
+export interface AppUpdateState {
+  phase: UpdatePhase
+  currentVersion: string
+  version?: string
+  notes?: string
+  downloadedBytes: number
+  totalBytes?: number
+  error?: string
+}
+
 export interface MetricFilters {
   startDate?: string
   endDate?: string

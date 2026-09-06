@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { Activity, Bot, Check, ChevronDown, CircleAlert, Database, Gauge, LoaderCircle, Pause, Play, RefreshCw, Settings, Sparkles, Users, X } from 'lucide-vue-next'
+import { Activity, Bot, Check, ChevronDown, CircleAlert, CloudDownload, Database, Gauge, LoaderCircle, PanelTop, Pause, Play, RefreshCw, Settings, Sparkles, Users, X } from 'lucide-vue-next'
 import { meterApi } from './api'
-import type { AgentKind, ImportStatus, MetricFilters, ModelStat, Overview, SourceInfo, TaskRow, TimeseriesPoint } from './shared'
+import type { AgentKind, AppSettings, AppUpdateState, ImportStatus, MetricFilters, ModelStat, Overview, SourceInfo, TaskRow, TimeseriesPoint } from './shared'
 
 const localDate = (date: Date) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
 const now = new Date()
@@ -18,8 +18,12 @@ const loading = ref(true)
 const error = ref('')
 const settingsOpen = ref(false)
 const autostartEnabled = ref(false)
+const appSettings = ref<AppSettings>({ menuMetrics: { todayTokens: true, ttft: false, effectiveTps: false }, updates: { automaticCheck: true, lastCheckedAt: null } })
+const updateState = ref<AppUpdateState>({ phase: 'idle', currentVersion: '0.2.0', downloadedBytes: 0 })
 const lastAction = ref('')
 const unlisteners: Array<() => void> = []
+let updateDelay: ReturnType<typeof setTimeout> | undefined
+let updateInterval: ReturnType<typeof setInterval> | undefined
 
 const projects = computed(() => [...new Set(tasks.value.map(task => task.project).filter(Boolean))].sort())
 const modelNames = computed(() => [...new Set(models.value.map(item => item.model))].sort())
@@ -39,6 +43,11 @@ const formatTps = (value: number | null) => value == null ? '—' : value.toFixe
 const formatTime = (value: string | null) => value ? new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(new Date(value)) : '—'
 const formatBytes = (value: number) => value >= 1_073_741_824 ? `${(value / 1_073_741_824).toFixed(1)} GB` : `${Math.round(value / 1_048_576)} MB`
 const childCount = (sessionId: string) => tasks.value.filter(task => task.parentThreadId === sessionId).length
+const updateProgress = computed(() => updateState.value.totalBytes ? Math.min(100, updateState.value.downloadedBytes / updateState.value.totalBytes * 100) : 0)
+const cloneSettings = (value: AppSettings): AppSettings => ({
+  menuMetrics: { ...value.menuMetrics },
+  updates: { ...value.updates },
+})
 
 async function loadAll(silent = false) {
   if (!silent) loading.value = true
@@ -80,17 +89,73 @@ async function toggleAutostart() {
   } catch (reason) { error.value = String(reason) }
 }
 
+async function saveSettings(next: AppSettings, message?: string) {
+  try {
+    appSettings.value = await meterApi.updateAppSettings(next)
+    if (message) lastAction.value = message
+  } catch (reason) { error.value = String(reason) }
+}
+
+async function toggleMenuMetric(metric: keyof AppSettings['menuMetrics']) {
+  const enabled = !appSettings.value.menuMetrics[metric]
+  const next = cloneSettings(appSettings.value)
+  next.menuMetrics[metric] = enabled
+  const names = { todayTokens: '今日 Token', ttft: '首响时间', effectiveTps: '有效 TPS' }
+  await saveSettings(next, `${names[metric]}已${enabled ? '显示' : '隐藏'}`)
+}
+
+async function toggleAutomaticUpdates() {
+  const next = cloneSettings(appSettings.value)
+  next.updates.automaticCheck = !next.updates.automaticCheck
+  await saveSettings(next, `自动检查更新已${next.updates.automaticCheck ? '开启' : '关闭'}`)
+}
+
+async function checkForUpdates(silent = false) {
+  if (updateState.value.phase === 'checking' || updateState.value.phase === 'downloading') return
+  updateState.value = { ...updateState.value, phase: 'checking', error: undefined }
+  try {
+    updateState.value = await meterApi.checkForUpdate()
+    const next = cloneSettings(appSettings.value)
+    next.updates.lastCheckedAt = new Date().toISOString()
+    appSettings.value = await meterApi.updateAppSettings(next)
+    if (!silent && updateState.value.phase === 'current') lastAction.value = 'Agent Meter 已是最新版'
+  } catch (reason) {
+    updateState.value = { ...updateState.value, phase: 'error', error: reason instanceof Error ? reason.message : String(reason) }
+  }
+}
+
+async function downloadAndRestart() {
+  try {
+    await meterApi.downloadAndInstallUpdate(state => { updateState.value = state })
+  } catch (reason) {
+    updateState.value = { ...updateState.value, phase: 'error', error: reason instanceof Error ? reason.message : String(reason) }
+  }
+}
+
 watch(filters, () => loadAll(), { deep: true })
 
 onMounted(async () => {
-  sources.value = await meterApi.discoverSources()
-  autostartEnabled.value = await meterApi.isAutostartEnabled()
+  const [nextSources, nextAutostart, nextSettings, currentVersion] = await Promise.all([
+    meterApi.discoverSources(), meterApi.isAutostartEnabled(), meterApi.getAppSettings(), meterApi.getCurrentVersion(),
+  ])
+  sources.value = nextSources
+  autostartEnabled.value = nextAutostart
+  appSettings.value = nextSettings
+  updateState.value.currentVersion = currentVersion
   await loadAll()
   unlisteners.push(await meterApi.on<ImportStatus>('import-progress', payload => { importStatus.value = payload }))
   unlisteners.push(await meterApi.on('metrics-updated', () => loadAll(true)))
   unlisteners.push(await meterApi.on<string>('source-error', payload => { error.value = payload }))
+  if (meterApi.isTauri()) {
+    updateDelay = setTimeout(() => { if (appSettings.value.updates.automaticCheck) void checkForUpdates(true) }, 15_000)
+    updateInterval = setInterval(() => { if (appSettings.value.updates.automaticCheck) void checkForUpdates(true) }, 86_400_000)
+  }
 })
-onBeforeUnmount(() => unlisteners.splice(0).forEach(fn => fn()))
+onBeforeUnmount(() => {
+  unlisteners.splice(0).forEach(fn => fn())
+  if (updateDelay) clearTimeout(updateDelay)
+  if (updateInterval) clearInterval(updateInterval)
+})
 </script>
 
 <template>
@@ -178,11 +243,13 @@ onBeforeUnmount(() => unlisteners.splice(0).forEach(fn => fn()))
     </section>
 
     <div v-if="settingsOpen" class="drawer-backdrop" @click.self="settingsOpen = false">
-      <aside class="settings-drawer" aria-label="数据源设置">
-        <header><div><span class="eyebrow">设置</span><h2>数据与索引</h2></div><button class="icon-button" aria-label="关闭设置" title="关闭" @click="settingsOpen = false"><X :size="19" /></button></header>
+      <aside class="settings-drawer" aria-label="Agent Meter 设置">
+        <header><div><span class="eyebrow">设置</span><h2>Agent Meter 设置</h2></div><button class="icon-button" aria-label="关闭设置" title="关闭" @click="settingsOpen = false"><X :size="19" /></button></header>
+        <section><h3>菜单栏指标</h3><div class="settings-note">每项独立占一个位置；应用图标始终保留。</div><div class="source-row"><div class="source-icon"><PanelTop :size="18" /></div><div><strong>今日 Token</strong><small>紧凑显示为“量 1.2M”</small></div><button class="switch" :class="{ on: appSettings.menuMetrics.todayTokens }" role="switch" :aria-checked="appSettings.menuMetrics.todayTokens" aria-label="切换今日 Token 菜单栏指标" @click="toggleMenuMetric('todayTokens')"><i></i></button></div><div class="source-row"><div class="source-icon"><Gauge :size="18" /></div><div><strong>首响时间</strong><small>最近 5 个有效任务中位数，显示为“首 680ms”</small></div><button class="switch" :class="{ on: appSettings.menuMetrics.ttft }" role="switch" :aria-checked="appSettings.menuMetrics.ttft" aria-label="切换首响时间菜单栏指标" @click="toggleMenuMetric('ttft')"><i></i></button></div><div class="source-row"><div class="source-icon"><Activity :size="18" /></div><div><strong>有效 TPS</strong><small>最近 5 个有效任务中位数，显示为“速 16.4”</small></div><button class="switch" :class="{ on: appSettings.menuMetrics.effectiveTps }" role="switch" :aria-checked="appSettings.menuMetrics.effectiveTps" aria-label="切换有效 TPS 菜单栏指标" @click="toggleMenuMetric('effectiveTps')"><i></i></button></div></section>
         <section><h3>本机数据源</h3><div v-for="source in sources" :key="source.id" class="source-row"><div class="source-icon"><Database :size="19" /></div><div><strong>{{ source.name }}</strong><small>{{ source.rootPath }} · {{ source.fileCount }} 个文件 · {{ formatBytes(source.totalBytes) }}</small><em v-if="source.error">{{ source.error }}</em></div><button class="switch" :class="{ on: source.enabled }" role="switch" :aria-checked="source.enabled" :aria-label="`${source.enabled ? '停用' : '启用'} ${source.name}`" @click="toggleSource(source)"><i></i></button></div></section>
         <section><h3>索引状态</h3><div class="import-card"><div><strong>{{ importStatus?.message || '正在读取状态' }}</strong><span>{{ importStatus?.filesDone ?? 0 }} / {{ importStatus?.filesTotal ?? 0 }} 个文件</span></div><progress :value="importStatus?.bytesDone ?? 0" :max="importStatus?.bytesTotal || 1"></progress><small v-if="importStatus?.currentFile">{{ importStatus.currentFile }}</small><div class="import-actions"><button v-if="importStatus?.running" class="secondary-button" @click="pauseImport"><Pause :size="16" />暂停</button><button v-else class="secondary-button" @click="runImport(false)"><Play :size="16" />继续扫描</button><button class="danger-button" @click="runImport(true)"><RefreshCw :size="16" />重建索引</button></div></div></section>
         <section><h3>应用</h3><div class="source-row"><div class="source-icon"><Play :size="19" /></div><div><strong>登录时启动</strong><small>默认关闭，可随时在这里启用。</small></div><button class="switch" :class="{ on: autostartEnabled }" role="switch" :aria-checked="autostartEnabled" aria-label="切换登录时启动" @click="toggleAutostart"><i></i></button></div></section>
+        <section><h3>软件更新</h3><div class="source-row"><div class="source-icon"><CloudDownload :size="19" /></div><div><strong>自动检查稳定版</strong><small>启动 15 秒后检查，之后每 24 小时检查。</small></div><button class="switch" :class="{ on: appSettings.updates.automaticCheck }" role="switch" :aria-checked="appSettings.updates.automaticCheck" aria-label="切换自动检查更新" @click="toggleAutomaticUpdates"><i></i></button></div><div class="update-card"><div class="update-heading"><div><strong>Agent Meter {{ updateState.currentVersion }}</strong><small v-if="appSettings.updates.lastCheckedAt">上次检查 {{ formatTime(appSettings.updates.lastCheckedAt) }}</small><small v-else>尚未检查更新</small></div><button class="secondary-button" :disabled="updateState.phase === 'checking' || updateState.phase === 'downloading'" @click="checkForUpdates(false)"><LoaderCircle v-if="updateState.phase === 'checking'" :size="15" class="spin" /><RefreshCw v-else :size="15" />检查更新</button></div><div v-if="updateState.phase === 'available'" class="update-available"><strong>发现 {{ updateState.version }}</strong><p v-if="updateState.notes">{{ updateState.notes }}</p><button class="primary-button" @click="downloadAndRestart"><CloudDownload :size="16" />下载并重启</button></div><div v-else-if="updateState.phase === 'downloading' || updateState.phase === 'ready'" class="update-download"><div><span>{{ updateState.phase === 'ready' ? '安装完成，正在重启' : '正在下载并验证' }}</span><span>{{ updateState.totalBytes ? `${Math.round(updateProgress)}%` : formatBytes(updateState.downloadedBytes) }}</span></div><progress :value="updateState.downloadedBytes" :max="updateState.totalBytes || Math.max(updateState.downloadedBytes, 1)"></progress></div><div v-else-if="updateState.phase === 'current'" class="update-message success-text"><Check :size="15" />已是最新版</div><div v-else-if="updateState.phase === 'error'" class="update-message error-text"><CircleAlert :size="15" />{{ updateState.error }}</div></div></section>
         <section class="privacy-note"><Database :size="18" /><p><strong>数据始终留在本机</strong><span>只读取数值指标，不保存提示词、回复正文、工具参数或工具输出。</span></p></section>
       </aside>
     </div>

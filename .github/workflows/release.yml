@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - name: Install dependencies
+        run: npm ci
+      - name: Test frontend
+        run: npm test
+      - name: Test Rust
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+      - name: Build and publish ARM64 release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: v__VERSION__
+          releaseName: Agent Meter v__VERSION__
+          releaseBody: |
+            Agent Meter 是本地只读的非官方 Codex 辅助工具，不上传会话数据，也不估算金额。
+
+            本版本提供 Apple Silicon DMG 和应用内更新包。DMG 尚未经过 Apple Developer ID 签名或 Apple 公证。
+          releaseDraft: false
+          prerelease: false
+          uploadUpdaterJson: true
+          args: --target aarch64-apple-darwin
+      - name: Upload DMG checksum
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd src-tauri/target/aarch64-apple-darwin/release/bundle/dmg
+          shasum -a 256 *.dmg > "$GITHUB_WORKSPACE/SHA256SUMS.txt"
+          cd "$GITHUB_WORKSPACE"
+          gh release upload "$GITHUB_REF_NAME" SHA256SUMS.txt --clobber

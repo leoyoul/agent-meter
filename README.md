@@ -11,11 +11,12 @@ Agent Meter 是一个本地优先的 macOS 菜单栏应用，用来查看 Codex 
 
 ## 功能
 
-- 菜单栏显示今日 Token、最近 5 个有效完成任务的首响中位数和有效 TPS 中位数。
+- 菜单栏以独立紧凑状态项显示今日 Token、最近 5 个有效完成任务的首响中位数和有效 TPS 中位数，每项均可单独开关。
 - 按日期、数据源、模型、项目和 Agent 类型筛选。
 - 查看 Token 趋势、模型 P50/P95、主子代理任务树和最近任务。
 - 首次流式索引历史 JSONL，随后通过文件监听增量更新，并以低频扫描兜底。
 - 支持暂停、断点续扫、数据源启停、重建索引和可选的登录启动。
+- 启动后自动检查稳定版更新，经用户确认后下载、验证、安装并重启。
 
 ## 隐私边界
 
@@ -36,7 +37,9 @@ Agent Meter 是一个本地优先的 macOS 菜单栏应用，用来查看 Codex 
 
 ## 安装
 
-从 [Releases](https://github.com/leoyoul/agent-meter/releases) 下载 Apple Silicon DMG。`v0.1.0` 尚未经过 Apple Developer ID 签名或公证，macOS 可能阻止直接启动；对供应链安全有要求时，请审查源码并自行构建。
+从 [Releases](https://github.com/leoyoul/agent-meter/releases) 下载 Apple Silicon DMG。`v0.2.0` 起支持应用内更新；`v0.1.0` 用户需要手动安装一次新版。DMG 尚未经过 Apple Developer ID 签名或公证，macOS 可能阻止直接启动；对供应链安全有要求时，请审查源码并自行构建。
+
+应用内更新包使用 Tauri 更新签名验证完整性。该签名不等同于 Apple Developer ID 签名或 Apple 公证。
 
 ## 数据源
 

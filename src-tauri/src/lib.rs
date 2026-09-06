@@ -1,6 +1,7 @@
 mod db;
 mod importer;
 mod models;
+mod settings;
 
 use chrono::Local;
 use importer::BackendState;
@@ -8,6 +9,7 @@ use models::{
     ImportStatus, MetricFilters, ModelStat, Overview, SourceInfo, TaskRow, TimeseriesPoint,
 };
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use settings::{AppSettings, SettingsState};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
@@ -88,6 +90,24 @@ fn update_source(
     db::update_source(&state.db_path, source_id, enabled)
 }
 
+#[tauri::command]
+fn get_app_settings(state: State<'_, SettingsState>) -> AppSettings {
+    state.load()
+}
+
+#[tauri::command]
+fn update_app_settings(
+    app: AppHandle,
+    backend: State<'_, BackendState>,
+    state: State<'_, SettingsState>,
+    settings: AppSettings,
+) -> Result<AppSettings, String> {
+    state.save(&settings)?;
+    sync_metric_trays(&app, &settings)?;
+    update_tray_titles(&app, backend.inner());
+    Ok(settings)
+}
+
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
@@ -96,49 +116,116 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
-fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
+fn tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let refresh = MenuItem::with_id(app, "refresh", "刷新", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "设置", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出 Agent Meter", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&refresh, &settings, &quit])?;
-    let mut builder = TrayIconBuilder::with_id("agent-meter-tray")
-        .title("今日 0 · 首响 -- · TPS --")
-        .tooltip("Agent Meter")
+    Menu::with_items(app, &[&refresh, &settings, &quit])
+}
+
+fn build_metric_tray(app: &AppHandle, id: &str, title: &str, tooltip: &str) -> tauri::Result<()> {
+    let menu = tray_menu(app)?;
+    TrayIconBuilder::with_id(id)
+        .title(title)
+        .tooltip(tooltip)
         .menu(&menu)
         .show_menu_on_left_click(false)
-        .on_tray_icon_event(|tray, event| {
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            } = event
-            {
-                show_main_window(tray.app_handle());
-            }
-        })
-        .on_menu_event(|app, event| match event.id().as_ref() {
-            "refresh" => {
-                let state = app.state::<BackendState>();
-                importer::start_background_import(app.clone(), state.inner().clone());
-            }
-            "settings" => {
-                show_main_window(app);
-                if let Some(window) = app.get_webview_window("main") {
-                    use tauri::Emitter;
-                    let _ = window.emit("open-settings", ());
-                }
-            }
-            "quit" => app.exit(0),
-            _ => {}
-        });
-    if let Some(icon) = app.default_window_icon() {
-        builder = builder.icon(icon.clone());
-    }
-    builder.build(app)?;
+        .build(app)?;
     Ok(())
 }
 
-fn update_tray_title(app: &AppHandle, state: &BackendState) {
+fn sync_metric_tray(
+    app: &AppHandle,
+    enabled: bool,
+    id: &str,
+    title: &str,
+    tooltip: &str,
+) -> Result<(), String> {
+    match (enabled, app.tray_by_id(id)) {
+        (true, None) => {
+            build_metric_tray(app, id, title, tooltip).map_err(|error| error.to_string())
+        }
+        (false, Some(_)) => {
+            app.remove_tray_by_id(id);
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn sync_metric_trays(app: &AppHandle, settings: &AppSettings) -> Result<(), String> {
+    for (id, enabled, title, tooltip) in metric_tray_specs(settings) {
+        sync_metric_tray(app, enabled, id, title, tooltip)?;
+    }
+    Ok(())
+}
+
+fn metric_tray_specs(
+    settings: &AppSettings,
+) -> [(&'static str, bool, &'static str, &'static str); 3] {
+    [
+        (
+            "metric-tokens",
+            settings.menu_metrics.today_tokens,
+            "量 --",
+            "今日 Token",
+        ),
+        (
+            "metric-ttft",
+            settings.menu_metrics.ttft,
+            "首 --",
+            "最近 5 个有效任务的首响中位数",
+        ),
+        (
+            "metric-tps",
+            settings.menu_metrics.effective_tps,
+            "速 --",
+            "最近 5 个有效任务的有效 TPS 中位数",
+        ),
+    ]
+}
+
+fn setup_trays(app: &tauri::App, settings: &AppSettings) -> tauri::Result<()> {
+    let menu = tray_menu(app.handle())?;
+    let mut builder = TrayIconBuilder::with_id("agent-meter-tray")
+        .tooltip("Agent Meter")
+        .menu(&menu)
+        .show_menu_on_left_click(false);
+    if let Some(icon) = app.default_window_icon() {
+        builder = builder.icon(icon.clone()).icon_as_template(true);
+    }
+    builder.build(app)?;
+    sync_metric_trays(app.handle(), settings).map_err(std::io::Error::other)?;
+
+    app.on_tray_icon_event(|tray, event| {
+        if let TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+            ..
+        } = event
+        {
+            show_main_window(tray.app_handle());
+        }
+    });
+    app.on_menu_event(|app, event| match event.id().as_ref() {
+        "refresh" => {
+            let state = app.state::<BackendState>();
+            importer::start_background_import(app.clone(), state.inner().clone());
+        }
+        "settings" => {
+            show_main_window(app);
+            if let Some(window) = app.get_webview_window("main") {
+                use tauri::Emitter;
+                let _ = window.emit("open-settings", ());
+            }
+        }
+        "quit" => app.exit(0),
+        _ => {}
+    });
+    Ok(())
+}
+
+fn update_tray_titles(app: &AppHandle, state: &BackendState) {
     let today = Local::now().format("%Y-%m-%d").to_string();
     let filters = MetricFilters {
         start_date: Some(today.clone()),
@@ -166,8 +253,14 @@ fn update_tray_title(app: &AppHandle, state: &BackendState) {
         .and_then(|overview| overview.recent_median_effective_tps)
         .map(|value| format!("{value:.1}"))
         .unwrap_or_else(|| "--".into());
-    if let Some(tray) = app.tray_by_id("agent-meter-tray") {
-        let _ = tray.set_title(Some(format!("今日 {token} · 首响 {ttft} · TPS {tps}")));
+    if let Some(tray) = app.tray_by_id("metric-tokens") {
+        let _ = tray.set_title(Some(format!("量 {token}")));
+    }
+    if let Some(tray) = app.tray_by_id("metric-ttft") {
+        let _ = tray.set_title(Some(format!("首 {ttft}")));
+    }
+    if let Some(tray) = app.tray_by_id("metric-tps") {
+        let _ = tray.set_title(Some(format!("速 {tps}")));
     }
 }
 
@@ -201,7 +294,7 @@ fn begin_background_loop(app: AppHandle, state: BackendState) {
             }
         }
 
-        update_tray_title(&app, &state);
+        update_tray_titles(&app, &state);
         importer::start_background_import(app.clone(), state.clone());
 
         loop {
@@ -217,7 +310,7 @@ fn begin_background_loop(app: AppHandle, state: BackendState) {
             };
             while rx.try_recv().is_ok() {}
             if should_scan {
-                update_tray_title(&app, &state);
+                update_tray_titles(&app, &state);
                 importer::start_background_import(app.clone(), state.clone());
             }
         }
@@ -252,6 +345,8 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -261,7 +356,10 @@ pub fn run() {
             db::migrate(&db_path).map_err(std::io::Error::other)?;
             let state = BackendState::new(db_path);
             app.manage(state.clone());
-            setup_tray(app)?;
+            let settings_state = SettingsState::new(app_data.join("settings.json"));
+            let settings = settings_state.load();
+            app.manage(settings_state);
+            setup_trays(app, &settings)?;
             begin_background_loop(app.handle().clone(), state);
             Ok(())
         })
@@ -280,7 +378,9 @@ pub fn run() {
             query_timeseries,
             query_model_stats,
             query_tasks,
-            update_source
+            update_source,
+            get_app_settings,
+            update_app_settings
         ])
         .build(tauri::generate_context!())
         .expect("error while building Agent Meter");
@@ -302,6 +402,25 @@ mod tests {
         assert_eq!(compact_number(999), "999");
         assert_eq!(compact_number(1_500), "1.5K");
         assert_eq!(compact_number(2_000_000), "2.0M");
+    }
+
+    #[test]
+    fn every_metric_visibility_combination_is_independent() {
+        for bits in 0_u8..8 {
+            let mut settings = AppSettings::default();
+            settings.menu_metrics.today_tokens = bits & 1 != 0;
+            settings.menu_metrics.ttft = bits & 2 != 0;
+            settings.menu_metrics.effective_tps = bits & 4 != 0;
+            let enabled = metric_tray_specs(&settings)
+                .into_iter()
+                .filter(|(_, visible, _, _)| *visible)
+                .map(|(id, _, _, _)| id)
+                .collect::<Vec<_>>();
+            assert_eq!(enabled.len(), bits.count_ones() as usize);
+            assert_eq!(enabled.contains(&"metric-tokens"), bits & 1 != 0);
+            assert_eq!(enabled.contains(&"metric-ttft"), bits & 2 != 0);
+            assert_eq!(enabled.contains(&"metric-tps"), bits & 4 != 0);
+        }
     }
 
     #[test]
