@@ -49,6 +49,9 @@ impl Default for UpdateSettings {
 pub struct AppSettings {
     #[serde(default)]
     pub menu_metrics: MenuMetrics,
+    /// 是否在菜单栏显示主应用图标；默认隐藏，指标项承载菜单入口。
+    #[serde(default)]
+    pub show_app_icon: bool,
     #[serde(default)]
     pub menu_period: crate::models::MetricPeriod,
     #[serde(default)]
@@ -119,6 +122,7 @@ mod tests {
         assert!(!settings.menu_metrics.estimated_cost);
         assert_eq!(settings.menu_period, crate::models::MetricPeriod::Realtime);
         assert_eq!(settings.active_source_kind, None);
+        assert!(!settings.show_app_icon);
         assert!(settings.updates.automatic_check);
     }
 

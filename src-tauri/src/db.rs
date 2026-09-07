@@ -117,6 +117,13 @@ pub fn migrate(path: &Path) -> AppResult<()> {
         )
         .map_err(to_error)?;
     }
+    if !has_column(&conn, "scan_files", "parse_error_count")? {
+        conn.execute(
+            "ALTER TABLE scan_files ADD COLUMN parse_error_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(to_error)?;
+    }
     sync_known_sources(&conn)?;
     conn.execute(
         "UPDATE sources SET enabled=0 WHERE name IN ('Yodex','Lodex')",
@@ -150,6 +157,8 @@ pub fn reset_index(path: &Path) -> AppResult<()> {
          DELETE FROM sessions;
          DELETE FROM scan_files;
          DELETE FROM usage_observations;
+         DELETE FROM model_call_observations;
+         DELETE FROM performance_observations;
          DELETE FROM source_sync_cursors;
          UPDATE sources SET last_scan_at=NULL, error=NULL;
          COMMIT;",

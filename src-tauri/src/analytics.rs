@@ -1,7 +1,8 @@
 use crate::db::{self, AppResult};
 use crate::models::{
-    AnalyticsFilters, MetricPeriod, MetricSeriesPoint, MetricSummary, ModelEffortStat,
-    PricingCatalogStatus, PricingCoverage, PricingRate, UsageTokens,
+    AnalyticsFilters, DataIntegrityStatus, MetricPeriod, MetricSeriesPoint, MetricSummary,
+    ModelEffortStat, PricingCatalogStatus, PricingCoverage, PricingModel, PricingRate,
+    PricingRateInput, SourceIntegrityStatus, UsageTokens,
 };
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, TimeZone, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
@@ -13,7 +14,7 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use walkdir::WalkDir;
 
-const CATALOG_VERSION: &str = "2026-09-06.1";
+const CATALOG_VERSION: &str = "2026-09-06.2";
 const VERIFIED_AT: &str = "2026-09-06";
 
 #[derive(Clone, Copy)]
@@ -33,6 +34,18 @@ struct RateDef {
 // Rates use pico-USD per token so sub-nano prices remain exact. Observation totals
 // are rounded once to integer nano-USD after all non-overlapping buckets are added.
 const RATES: &[RateDef] = &[
+    RateDef {
+        vendor: "OpenAI",
+        model: "gpt-6-astra",
+        aliases: &[],
+        input: 10_000_000,
+        cached_read: Some(1_000_000),
+        cached_write: Some(12_500_000),
+        output: 50_000_000,
+        effective_from: "2026-09-07",
+        effective_to: None,
+        source_url: "https://developers.openai.com/api/docs/models/gpt-6-astra",
+    },
     RateDef {
         vendor: "OpenAI",
         model: "gpt-5.6-sol",
@@ -193,6 +206,21 @@ const RATES: &[RateDef] = &[
         effective_to: None,
         source_url: "https://api-docs.deepseek.com/quick_start/pricing",
     },
+    RateDef {
+        vendor: "Meta",
+        model: "muse-spark-1.3",
+        aliases: &[
+            "muse-spark-1.3-contributor",
+            "muse-spark-1.3-contributor-free",
+        ],
+        input: 100_000,
+        cached_read: Some(2_000),
+        cached_write: None,
+        output: 200_000,
+        effective_from: "2026-09-03",
+        effective_to: None,
+        source_url: "https://vercel.com/changelog/muse-spark-1-3-now-available-on-ai-gateway",
+    },
 ];
 
 #[derive(Clone)]
@@ -244,11 +272,87 @@ pub fn migrate(conn: &Connection) -> AppResult<()> {
             source_id INTEGER PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
             updated_ms INTEGER NOT NULL DEFAULT 0,
             external_id TEXT NOT NULL DEFAULT ''
+         );
+         CREATE TABLE IF NOT EXISTS model_call_observations (
+            source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+            external_id TEXT NOT NULL,
+            provider TEXT NOT NULL DEFAULT 'unknown',
+            model TEXT NOT NULL DEFAULT 'unknown',
+            reasoning_effort TEXT NOT NULL DEFAULT 'default',
+            occurred_at_ms INTEGER NOT NULL,
+            uncached_input_tokens INTEGER NOT NULL DEFAULT 0,
+            cached_read_tokens INTEGER NOT NULL DEFAULT 0,
+            cached_write_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0,
+            estimated_cost_nano_usd INTEGER NOT NULL DEFAULT 0,
+            priced_tokens INTEGER NOT NULL DEFAULT 0,
+            pricing_status TEXT NOT NULL DEFAULT 'unpriced',
+            pricing_rate_id INTEGER,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(source_id, external_id)
+         );
+         CREATE INDEX IF NOT EXISTS idx_call_observations_time ON model_call_observations(occurred_at_ms);
+         CREATE INDEX IF NOT EXISTS idx_call_observations_dimensions ON model_call_observations(source_id, model, reasoning_effort);
+         CREATE TABLE IF NOT EXISTS performance_observations (
+            source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+            external_id TEXT NOT NULL,
+            provider TEXT NOT NULL DEFAULT 'unknown',
+            model TEXT NOT NULL DEFAULT 'unknown',
+            reasoning_effort TEXT NOT NULL DEFAULT 'default',
+            occurred_at_ms INTEGER NOT NULL,
+            duration_ms INTEGER,
+            ttft_ms INTEGER,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(source_id, external_id)
+         );
+         CREATE INDEX IF NOT EXISTS idx_performance_observations_time ON performance_observations(occurred_at_ms);
+         CREATE TABLE IF NOT EXISTS pricing_rates (
+            id INTEGER PRIMARY KEY,
+            vendor TEXT NOT NULL,
+            model TEXT NOT NULL COLLATE NOCASE,
+            input_pico_per_token INTEGER NOT NULL,
+            cached_read_pico_per_token INTEGER,
+            cached_write_pico_per_token INTEGER,
+            output_pico_per_token INTEGER NOT NULL,
+            effective_from TEXT NOT NULL,
+            effective_to TEXT,
+            source_url TEXT NOT NULL DEFAULT '',
+            verified_at TEXT NOT NULL,
+            origin TEXT NOT NULL DEFAULT 'builtin',
+            user_modified INTEGER NOT NULL DEFAULT 0,
+            deleted_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(model, effective_from)
+         );
+         CREATE TABLE IF NOT EXISTS pricing_rate_aliases (
+            rate_id INTEGER NOT NULL REFERENCES pricing_rates(id) ON DELETE CASCADE,
+            alias TEXT NOT NULL COLLATE NOCASE,
+            PRIMARY KEY(rate_id, alias)
+         );
+         CREATE TABLE IF NOT EXISTS pricing_seed_tombstones (
+            model TEXT NOT NULL COLLATE NOCASE,
+            effective_from TEXT NOT NULL,
+            deleted_at TEXT NOT NULL,
+            PRIMARY KEY(model, effective_from)
          );",
     )
     .map_err(db::to_error)?;
+    seed_pricing_rates(conn)?;
     sync_codex_turns(conn)?;
-    reprice_conn(conn)
+    conn.execute_batch("SAVEPOINT analytics_v2")
+        .map_err(db::to_error)?;
+    let result = materialize_observations(conn).and_then(|_| reprice_conn(conn));
+    if result.is_ok() {
+        conn.execute_batch("RELEASE analytics_v2")
+            .map_err(db::to_error)?;
+    } else {
+        let _ = conn.execute_batch("ROLLBACK TO analytics_v2; RELEASE analytics_v2");
+    }
+    result
 }
 
 pub fn sync_all_sources(path: &Path) -> AppResult<()> {
@@ -261,6 +365,7 @@ pub fn sync_all_sources(path: &Path) -> AppResult<()> {
         sync_opencode(&conn)?;
         sync_dsh(&conn)?;
         sync_evox(&conn)?;
+        materialize_observations(&conn)?;
         reprice_conn(&conn)
     })();
     if result.is_ok() {
@@ -342,6 +447,139 @@ fn sync_codex_turns(conn: &Connection) -> AppResult<()> {
         )?;
     }
     Ok(())
+}
+
+fn seed_pricing_rates(conn: &Connection) -> AppResult<()> {
+    let now = Utc::now().to_rfc3339();
+    for rate in RATES {
+        let tombstoned = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pricing_seed_tombstones WHERE model=?1 AND effective_from=?2)",
+                params![rate.model, rate.effective_from],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(db::to_error)?;
+        if tombstoned {
+            continue;
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO pricing_rates(vendor,model,input_pico_per_token,cached_read_pico_per_token,cached_write_pico_per_token,output_pico_per_token,effective_from,effective_to,source_url,verified_at,origin,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'builtin',?11,?11)",
+            params![rate.vendor,rate.model,rate.input,rate.cached_read,rate.cached_write,rate.output,rate.effective_from,rate.effective_to,rate.source_url,VERIFIED_AT,now],
+        ).map_err(db::to_error)?;
+        let id = conn.query_row(
+            "SELECT id FROM pricing_rates WHERE model=?1 AND effective_from=?2 AND deleted_at IS NULL",
+            params![rate.model, rate.effective_from],
+            |row| row.get::<_, i64>(0),
+        ).optional().map_err(db::to_error)?;
+        if let Some(id) = id {
+            for alias in rate.aliases {
+                conn.execute(
+                    "INSERT OR IGNORE INTO pricing_rate_aliases(rate_id,alias) VALUES (?1,?2)",
+                    params![id, alias],
+                )
+                .map_err(db::to_error)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn materialize_observations(conn: &Connection) -> AppResult<()> {
+    conn.execute("DELETE FROM model_call_observations", [])
+        .map_err(db::to_error)?;
+    conn.execute("DELETE FROM performance_observations", [])
+        .map_err(db::to_error)?;
+
+    conn.execute(
+        "INSERT INTO model_call_observations(source_id,external_id,provider,model,reasoning_effort,occurred_at_ms,uncached_input_tokens,cached_read_tokens,cached_write_tokens,output_tokens,reasoning_tokens,total_tokens,updated_at)
+         SELECT o.source_id,o.external_id,o.provider,o.model,o.reasoning_effort,o.completed_at_ms,
+                o.uncached_input_tokens,o.cached_read_tokens,o.cached_write_tokens,o.output_tokens,o.reasoning_tokens,o.total_tokens,o.updated_at
+         FROM usage_observations o JOIN sources s ON s.id=o.source_id
+         WHERE s.source_kind!='codex_jsonl' AND o.status='completed' AND o.completed_at_ms IS NOT NULL AND o.total_tokens>0",
+        [],
+    ).map_err(db::to_error)?;
+    conn.execute(
+        "INSERT INTO performance_observations(source_id,external_id,provider,model,reasoning_effort,occurred_at_ms,duration_ms,ttft_ms,output_tokens,updated_at)
+         SELECT o.source_id,o.external_id,o.provider,o.model,o.reasoning_effort,o.completed_at_ms,o.duration_ms,o.ttft_ms,o.output_tokens,o.updated_at
+         FROM usage_observations o JOIN sources s ON s.id=o.source_id
+         WHERE s.source_kind!='codex_jsonl' AND o.status='completed' AND o.completed_at_ms IS NOT NULL AND o.duration_ms IS NOT NULL",
+        [],
+    ).map_err(db::to_error)?;
+
+    let mut stmt = conn.prepare(
+        "SELECT t.source_id,c.response_id,t.model,t.reasoning_effort,c.occurred_at,c.input_tokens,c.cached_input_tokens,c.output_tokens,c.reasoning_tokens,c.total_tokens,t.updated_at
+         FROM model_calls c JOIN turns t ON t.turn_id=c.turn_id
+         WHERE c.total_tokens>0 AND (
+           c.call_kind='primary' OR (c.call_kind='legacy' AND NOT EXISTS (
+             SELECT 1 FROM model_calls p WHERE p.turn_id=c.turn_id AND p.call_kind='primary'
+           ))
+         )",
+    ).map_err(db::to_error)?;
+    let calls = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, String>(10)?,
+            ))
+        })
+        .map_err(db::to_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db::to_error)?;
+    for (
+        source_id,
+        id,
+        model,
+        effort,
+        occurred,
+        input,
+        cached,
+        output,
+        reasoning,
+        total,
+        updated,
+    ) in calls
+    {
+        let occurred_ms = parse_iso_ms(&occurred).unwrap_or(0);
+        conn.execute(
+            "INSERT INTO model_call_observations(source_id,external_id,provider,model,reasoning_effort,occurred_at_ms,uncached_input_tokens,cached_read_tokens,cached_write_tokens,output_tokens,reasoning_tokens,total_tokens,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,0,?9,?10,?11,?12)",
+            params![source_id,id,infer_vendor(&model),model,normalize_effort(effort.as_deref()),occurred_ms,(input-cached).max(0),cached.max(0),output.max(0),reasoning.max(0),total.max(0),updated],
+        ).map_err(db::to_error)?;
+    }
+    conn.execute(
+        "INSERT INTO performance_observations(source_id,external_id,provider,model,reasoning_effort,occurred_at_ms,duration_ms,ttft_ms,output_tokens,updated_at)
+         SELECT t.source_id,'turn:'||t.turn_id,CASE WHEN lower(t.model) LIKE 'gpt-%' THEN 'OpenAI' ELSE 'unknown' END,
+                t.model,COALESCE(NULLIF(lower(t.reasoning_effort),''),'default'),
+                CAST(strftime('%s',t.completed_at) AS INTEGER)*1000,t.duration_ms,t.ttft_ms,t.output_tokens,t.updated_at
+         FROM turns t JOIN sources s ON s.id=t.source_id
+         WHERE s.source_kind='codex_jsonl' AND t.status='completed' AND t.completed_at IS NOT NULL AND t.duration_ms IS NOT NULL",
+        [],
+    ).map_err(db::to_error)?;
+    Ok(())
+}
+
+pub fn sync_codex_incremental(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(db::to_error)?;
+    let result = sync_codex_turns(conn)
+        .and_then(|_| materialize_observations(conn))
+        .and_then(|_| reprice_conn(conn));
+    if result.is_ok() {
+        conn.execute_batch("COMMIT").map_err(db::to_error)?;
+    } else {
+        let _ = conn.execute_batch("ROLLBACK");
+    }
+    result
 }
 
 fn readonly(path: &Path) -> AppResult<Connection> {
@@ -1197,6 +1435,7 @@ fn is_local(provider: &str, model: &str) -> bool {
             .any(|prefix| m.starts_with(prefix))
 }
 
+#[cfg(test)]
 fn rate_for(model: &str, date: &str) -> Option<&'static RateDef> {
     RATES
         .iter()
@@ -1212,8 +1451,96 @@ fn rate_for(model: &str, date: &str) -> Option<&'static RateDef> {
         .max_by_key(|rate| rate.effective_from)
 }
 
+#[derive(Clone)]
+struct DbRate {
+    id: i64,
+    model: String,
+    aliases: Vec<String>,
+    input: i64,
+    cached_read: Option<i64>,
+    cached_write: Option<i64>,
+    output: i64,
+    effective_from: String,
+    effective_to: Option<String>,
+}
+
+fn load_db_rates(conn: &Connection) -> AppResult<Vec<DbRate>> {
+    let mut stmt = conn.prepare(
+        "SELECT id,vendor,model,input_pico_per_token,cached_read_pico_per_token,cached_write_pico_per_token,output_pico_per_token,effective_from,effective_to
+         FROM pricing_rates WHERE deleted_at IS NULL ORDER BY effective_from",
+    ).map_err(db::to_error)?;
+    let base = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Option<String>>(8)?,
+            ))
+        })
+        .map_err(db::to_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db::to_error)?;
+    let mut result = Vec::with_capacity(base.len());
+    for (
+        id,
+        vendor,
+        model,
+        input,
+        cached_read,
+        cached_write,
+        output,
+        effective_from,
+        effective_to,
+    ) in base
+    {
+        let mut alias_stmt = conn
+            .prepare("SELECT alias FROM pricing_rate_aliases WHERE rate_id=?1 ORDER BY alias")
+            .map_err(db::to_error)?;
+        let aliases = alias_stmt
+            .query_map([id], |row| row.get::<_, String>(0))
+            .map_err(db::to_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db::to_error)?;
+        let _ = vendor;
+        result.push(DbRate {
+            id,
+            model,
+            aliases,
+            input,
+            cached_read,
+            cached_write,
+            output,
+            effective_from,
+            effective_to,
+        });
+    }
+    Ok(result)
+}
+
+fn db_rate_for<'a>(rates: &'a [DbRate], model: &str, date: &str) -> Option<&'a DbRate> {
+    rates
+        .iter()
+        .filter(|rate| rate.effective_from.as_str() <= date)
+        .filter(|rate| rate.effective_to.as_deref().is_none_or(|end| date < end))
+        .filter(|rate| {
+            rate.model.eq_ignore_ascii_case(model)
+                || rate
+                    .aliases
+                    .iter()
+                    .any(|alias| alias.eq_ignore_ascii_case(model))
+        })
+        .max_by_key(|rate| rate.effective_from.as_str())
+}
+
 fn reprice_conn(conn: &Connection) -> AppResult<()> {
-    let mut stmt = conn.prepare("SELECT source_id,external_id,provider,model,started_at_ms,uncached_input_tokens,cached_read_tokens,cached_write_tokens,output_tokens,total_tokens FROM usage_observations").map_err(db::to_error)?;
+    let rates = load_db_rates(conn)?;
+    let mut stmt = conn.prepare("SELECT source_id,external_id,provider,model,occurred_at_ms,uncached_input_tokens,cached_read_tokens,cached_write_tokens,output_tokens,total_tokens FROM model_call_observations").map_err(db::to_error)?;
     let rows = stmt
         .query_map([], |row| {
             Ok((
@@ -1250,8 +1577,8 @@ fn reprice_conn(conn: &Connection) -> AppResult<()> {
             .map(|v| v.format("%Y-%m-%d").to_string())
             .unwrap_or_else(|| "1970-01-01".into());
         let (cost, priced, status, key) = if is_local(&provider, &model) {
-            (0, total, "free", Some("local".to_string()))
-        } else if let Some(rate) = rate_for(&model, &date) {
+            (0, total, "free", None::<i64>)
+        } else if let Some(rate) = db_rate_for(&rates, &model, &date) {
             let mut cost_pico =
                 uncached.saturating_mul(rate.input) + output.saturating_mul(rate.output);
             let mut priced = uncached + output;
@@ -1265,16 +1592,11 @@ fn reprice_conn(conn: &Connection) -> AppResult<()> {
             }
             let cost = cost_pico.saturating_add(500) / 1_000;
             let status = if priced >= total { "priced" } else { "partial" };
-            (
-                cost,
-                priced,
-                status,
-                Some(format!("{}:{}", rate.vendor, rate.model)),
-            )
+            (cost, priced, status, Some(rate.id))
         } else {
             (0, 0, "unpriced", None)
         };
-        conn.execute("UPDATE usage_observations SET estimated_cost_nano_usd=?1,priced_tokens=?2,pricing_status=?3,pricing_rate_key=?4 WHERE source_id=?5 AND external_id=?6", params![cost,priced,status,key,source_id,id]).map_err(db::to_error)?;
+        conn.execute("UPDATE model_call_observations SET estimated_cost_nano_usd=?1,priced_tokens=?2,pricing_status=?3,pricing_rate_id=?4 WHERE source_id=?5 AND external_id=?6", params![cost,priced,status,key,source_id,id]).map_err(db::to_error)?;
     }
     Ok(())
 }
@@ -1290,30 +1612,373 @@ pub fn pricing_catalog_status(path: &Path) -> AppResult<PricingCatalogStatus> {
 }
 
 fn pricing_status_conn(conn: &Connection) -> AppResult<PricingCatalogStatus> {
-    let (priced,total) = conn.query_row("SELECT count(*) FILTER (WHERE pricing_status IN ('priced','free')),count(*) FROM usage_observations WHERE status='completed'", [], |row| Ok((row.get(0)?,row.get(1)?))).map_err(db::to_error)?;
+    let (priced,total) = conn.query_row("SELECT count(*) FILTER (WHERE pricing_status IN ('priced','free')),count(*) FROM model_call_observations", [], |row| Ok((row.get(0)?,row.get(1)?))).map_err(db::to_error)?;
+    let rates = pricing_rates_conn(conn)?;
     Ok(PricingCatalogStatus {
         version: CATALOG_VERSION.into(),
         currency: "USD".into(),
         verified_at: VERIFIED_AT.into(),
-        rates: RATES
-            .iter()
-            .map(|r| PricingRate {
-                vendor: r.vendor.into(),
-                model: r.model.into(),
-                aliases: r.aliases.iter().map(|v| (*v).into()).collect(),
-                currency: "USD".into(),
-                input_usd_per_million: rate_string(r.input),
-                cached_read_usd_per_million: r.cached_read.map(rate_string),
-                cached_write_usd_per_million: r.cached_write.map(rate_string),
-                output_usd_per_million: rate_string(r.output),
-                effective_from: r.effective_from.into(),
-                effective_to: r.effective_to.map(Into::into),
-                source_url: r.source_url.into(),
-                verified_at: VERIFIED_AT.into(),
-            })
-            .collect(),
+        rates,
         priced_observations: priced,
         total_observations: total,
+    })
+}
+
+fn pricing_rates_conn(conn: &Connection) -> AppResult<Vec<PricingRate>> {
+    let mut stmt = conn.prepare(
+        "SELECT r.id,r.vendor,r.model,r.input_pico_per_token,r.cached_read_pico_per_token,r.cached_write_pico_per_token,r.output_pico_per_token,r.effective_from,r.effective_to,r.source_url,r.verified_at,r.origin,
+                (SELECT count(*) FROM model_call_observations o WHERE o.pricing_rate_id=r.id)
+         FROM pricing_rates r WHERE r.deleted_at IS NULL ORDER BY lower(r.model),r.effective_from DESC",
+    ).map_err(db::to_error)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
+                row.get::<_, String>(11)?,
+                row.get::<_, i64>(12)?,
+            ))
+        })
+        .map_err(db::to_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db::to_error)?;
+    let mut result = Vec::with_capacity(rows.len());
+    for (
+        id,
+        vendor,
+        model,
+        input,
+        cached_read,
+        cached_write,
+        output,
+        effective_from,
+        effective_to,
+        source_url,
+        verified_at,
+        origin,
+        call_count,
+    ) in rows
+    {
+        let mut alias_stmt = conn
+            .prepare("SELECT alias FROM pricing_rate_aliases WHERE rate_id=?1 ORDER BY alias")
+            .map_err(db::to_error)?;
+        let aliases = alias_stmt
+            .query_map([id], |row| row.get::<_, String>(0))
+            .map_err(db::to_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db::to_error)?;
+        result.push(PricingRate {
+            id,
+            vendor,
+            model,
+            aliases,
+            currency: "USD".into(),
+            input_usd_per_million: rate_string(input),
+            cached_read_usd_per_million: cached_read.map(rate_string),
+            cached_write_usd_per_million: cached_write.map(rate_string),
+            output_usd_per_million: rate_string(output),
+            effective_from,
+            effective_to,
+            source_url,
+            verified_at,
+            origin,
+            call_count,
+        });
+    }
+    Ok(result)
+}
+
+fn parse_price(value: &str, field: &str) -> AppResult<i64> {
+    let value = value
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| format!("{field} 必须是非负数字"))?;
+    if !value.is_finite() || value < 0.0 {
+        return Err(format!("{field} 必须是非负数字"));
+    }
+    Ok((value * 1_000_000.0).round() as i64)
+}
+
+fn parse_optional_price(value: Option<&str>, field: &str) -> AppResult<Option<i64>> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| parse_price(value, field))
+        .transpose()
+}
+
+fn validate_rate(
+    conn: &Connection,
+    input: &PricingRateInput,
+    exclude_id: Option<i64>,
+) -> AppResult<()> {
+    if input.vendor.trim().is_empty() || input.model.trim().is_empty() {
+        return Err("Vendor 和模型不能为空".into());
+    }
+    NaiveDate::parse_from_str(&input.effective_from, "%Y-%m-%d")
+        .map_err(|_| "生效日期格式必须为 YYYY-MM-DD".to_string())?;
+    if let Some(end) = input
+        .effective_to
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        NaiveDate::parse_from_str(end, "%Y-%m-%d")
+            .map_err(|_| "结束日期格式必须为 YYYY-MM-DD".to_string())?;
+        if end <= input.effective_from.as_str() {
+            return Err("结束日期必须晚于生效日期".into());
+        }
+    }
+    let names = std::iter::once(input.model.trim())
+        .chain(input.aliases.iter().map(String::as_str))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .collect::<Vec<_>>();
+    let rates = load_db_rates(conn)?;
+    for rate in rates.into_iter().filter(|rate| Some(rate.id) != exclude_id) {
+        let rate_names =
+            std::iter::once(rate.model.as_str()).chain(rate.aliases.iter().map(String::as_str));
+        if !names.iter().any(|name| {
+            rate_names
+                .clone()
+                .any(|other| name.eq_ignore_ascii_case(other))
+        }) {
+            continue;
+        }
+        let new_end = input
+            .effective_to
+            .as_deref()
+            .filter(|v| !v.is_empty())
+            .unwrap_or("9999-12-31");
+        let old_end = rate.effective_to.as_deref().unwrap_or("9999-12-31");
+        if input.effective_from.as_str() < old_end && rate.effective_from.as_str() < new_end {
+            return Err(format!("{} 的价格生效区间与现有版本重叠", input.model));
+        }
+    }
+    Ok(())
+}
+
+fn write_aliases(conn: &Connection, id: i64, aliases: &[String]) -> AppResult<()> {
+    conn.execute("DELETE FROM pricing_rate_aliases WHERE rate_id=?1", [id])
+        .map_err(db::to_error)?;
+    for alias in aliases.iter().map(|v| v.trim()).filter(|v| !v.is_empty()) {
+        conn.execute(
+            "INSERT OR IGNORE INTO pricing_rate_aliases(rate_id,alias) VALUES (?1,?2)",
+            params![id, alias],
+        )
+        .map_err(db::to_error)?;
+    }
+    Ok(())
+}
+
+pub fn create_pricing_rate(path: &Path, input: PricingRateInput) -> AppResult<PricingRate> {
+    let conn = db::open(path)?;
+    validate_rate(&conn, &input, None)?;
+    let now = Utc::now().to_rfc3339();
+    conn.execute("INSERT INTO pricing_rates(vendor,model,input_pico_per_token,cached_read_pico_per_token,cached_write_pico_per_token,output_pico_per_token,effective_from,effective_to,source_url,verified_at,origin,user_modified,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'custom',1,?10,?10)", params![input.vendor.trim(),input.model.trim(),parse_price(&input.input_usd_per_million,"输入价格")?,parse_optional_price(input.cached_read_usd_per_million.as_deref(),"缓存读取价格")?,parse_optional_price(input.cached_write_usd_per_million.as_deref(),"缓存写入价格")?,parse_price(&input.output_usd_per_million,"输出价格")?,input.effective_from,input.effective_to.as_deref().filter(|v| !v.is_empty()),input.source_url.trim(),now]).map_err(db::to_error)?;
+    let id = conn.last_insert_rowid();
+    write_aliases(&conn, id, &input.aliases)?;
+    reprice_conn(&conn)?;
+    pricing_rates_conn(&conn)?
+        .into_iter()
+        .find(|rate| rate.id == id)
+        .ok_or_else(|| "价格保存后未找到".into())
+}
+
+pub fn update_pricing_rate(
+    path: &Path,
+    id: i64,
+    input: PricingRateInput,
+) -> AppResult<PricingRate> {
+    let conn = db::open(path)?;
+    validate_rate(&conn, &input, Some(id))?;
+    let now = Utc::now().to_rfc3339();
+    let changed=conn.execute("UPDATE pricing_rates SET vendor=?1,model=?2,input_pico_per_token=?3,cached_read_pico_per_token=?4,cached_write_pico_per_token=?5,output_pico_per_token=?6,effective_from=?7,effective_to=?8,source_url=?9,verified_at=?10,origin='custom',user_modified=1,updated_at=?10 WHERE id=?11 AND deleted_at IS NULL",params![input.vendor.trim(),input.model.trim(),parse_price(&input.input_usd_per_million,"输入价格")?,parse_optional_price(input.cached_read_usd_per_million.as_deref(),"缓存读取价格")?,parse_optional_price(input.cached_write_usd_per_million.as_deref(),"缓存写入价格")?,parse_price(&input.output_usd_per_million,"输出价格")?,input.effective_from,input.effective_to.as_deref().filter(|v| !v.is_empty()),input.source_url.trim(),now,id]).map_err(db::to_error)?;
+    if changed == 0 {
+        return Err("价格版本不存在".into());
+    }
+    write_aliases(&conn, id, &input.aliases)?;
+    reprice_conn(&conn)?;
+    pricing_rates_conn(&conn)?
+        .into_iter()
+        .find(|rate| rate.id == id)
+        .ok_or_else(|| "价格更新后未找到".into())
+}
+
+pub fn delete_pricing_rate(path: &Path, id: i64) -> AppResult<()> {
+    let conn = db::open(path)?;
+    let row=conn.query_row("SELECT model,effective_from,origin FROM pricing_rates WHERE id=?1 AND deleted_at IS NULL",[id],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?))).optional().map_err(db::to_error)?.ok_or_else(||"价格版本不存在".to_string())?;
+    let now = Utc::now().to_rfc3339();
+    if row.2 == "builtin" {
+        conn.execute("INSERT OR REPLACE INTO pricing_seed_tombstones(model,effective_from,deleted_at) VALUES (?1,?2,?3)",params![row.0,row.1,now]).map_err(db::to_error)?;
+    }
+    conn.execute(
+        "UPDATE pricing_rates SET deleted_at=?1,updated_at=?1 WHERE id=?2",
+        params![now, id],
+    )
+    .map_err(db::to_error)?;
+    reprice_conn(&conn)
+}
+
+struct PricingModelBuilder {
+    model: String,
+    vendor: String,
+    call_count: i64,
+    total_tokens: i64,
+    pricing_status: String,
+    rates: Vec<PricingRate>,
+}
+
+pub fn list_pricing_models(path: &Path) -> AppResult<Vec<PricingModel>> {
+    let conn = db::open(path)?;
+    let rates = pricing_rates_conn(&conn)?;
+    let mut models: BTreeMap<String, PricingModelBuilder> = BTreeMap::new();
+    let mut stmt=conn.prepare("SELECT model,provider,count(*),sum(total_tokens),CASE WHEN sum(priced_tokens)>=sum(total_tokens) THEN 'priced' WHEN sum(priced_tokens)>0 THEN 'partial' ELSE 'unpriced' END FROM model_call_observations GROUP BY model,provider").map_err(db::to_error)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(db::to_error)?;
+    for row in rows {
+        let (model, vendor, calls, tokens, status) = row.map_err(db::to_error)?;
+        models.insert(
+            model.to_ascii_lowercase(),
+            PricingModelBuilder {
+                model,
+                vendor,
+                call_count: calls,
+                total_tokens: tokens,
+                pricing_status: status,
+                rates: Vec::new(),
+            },
+        );
+    }
+    for rate in rates {
+        let matching_keys = models
+            .iter()
+            .filter(|(_, item)| {
+                rate.model.eq_ignore_ascii_case(&item.model)
+                    || rate
+                        .aliases
+                        .iter()
+                        .any(|alias| alias.eq_ignore_ascii_case(&item.model))
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        if matching_keys.is_empty() {
+            models.insert(
+                rate.model.to_ascii_lowercase(),
+                PricingModelBuilder {
+                    model: rate.model.clone(),
+                    vendor: rate.vendor.clone(),
+                    call_count: 0,
+                    total_tokens: 0,
+                    pricing_status: "unused".into(),
+                    rates: vec![rate],
+                },
+            );
+        } else {
+            for key in matching_keys {
+                if let Some(entry) = models.get_mut(&key) {
+                    entry.vendor = rate.vendor.clone();
+                    entry.rates.push(rate.clone());
+                }
+            }
+        }
+    }
+    Ok(models
+        .into_values()
+        .map(|item| PricingModel {
+            model: item.model,
+            vendor: item.vendor,
+            call_count: item.call_count,
+            total_tokens: item.total_tokens,
+            pricing_status: item.pricing_status,
+            rates: item.rates,
+        })
+        .collect())
+}
+
+pub fn get_data_integrity_status(path: &Path) -> AppResult<DataIntegrityStatus> {
+    let conn = db::open(path)?;
+    let mut stmt=conn.prepare("SELECT id,name,source_kind,error FROM sources WHERE enabled=1 AND name NOT IN ('Yodex','Lodex') ORDER BY id").map_err(db::to_error)?;
+    let source_rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .map_err(db::to_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db::to_error)?;
+    let mut sources = Vec::new();
+    for (source_id, source_name, kind, source_error) in source_rows {
+        let raw_call_count = if kind == "codex_jsonl" {
+            conn.query_row("SELECT count(*) FROM model_calls c JOIN turns t ON t.turn_id=c.turn_id WHERE t.source_id=?1 AND c.total_tokens>0 AND (c.call_kind='primary' OR (c.call_kind='legacy' AND NOT EXISTS(SELECT 1 FROM model_calls p WHERE p.turn_id=c.turn_id AND p.call_kind='primary')))",[source_id],|row|row.get::<_,i64>(0)).map_err(db::to_error)?
+        } else {
+            conn.query_row("SELECT count(*) FROM usage_observations WHERE source_id=?1 AND status='completed' AND total_tokens>0",[source_id],|row|row.get::<_,i64>(0)).map_err(db::to_error)?
+        };
+        let indexed_call_count = conn
+            .query_row(
+                "SELECT count(*) FROM model_call_observations WHERE source_id=?1",
+                [source_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(db::to_error)?;
+        let (unread_bytes,parse_error_count,file_error):(i64,i64,Option<String>)=conn.query_row("SELECT COALESCE(sum(max(size-offset,0)),0),COALESCE(sum(parse_error_count),0),max(error) FROM scan_files WHERE source_id=?1",[source_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).map_err(db::to_error)?;
+        let last_ms = conn
+            .query_row(
+                "SELECT max(occurred_at_ms) FROM model_call_observations WHERE source_id=?1",
+                [source_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map_err(db::to_error)?;
+        let difference = raw_call_count - indexed_call_count;
+        let error = source_error.or(file_error);
+        let reconciled =
+            difference == 0 && unread_bytes == 0 && parse_error_count == 0 && error.is_none();
+        sources.push(SourceIntegrityStatus {
+            source_id,
+            source_name,
+            raw_call_count,
+            indexed_call_count,
+            difference,
+            unread_bytes,
+            parse_error_count,
+            last_call_at: last_ms
+                .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
+                .map(|v| v.to_rfc3339()),
+            sync_delay_ms: Some(if unread_bytes == 0 {
+                0
+            } else {
+                last_ms
+                    .map(|ms| (Utc::now().timestamp_millis() - ms).max(0))
+                    .unwrap_or(0)
+            }),
+            reconciled,
+            error,
+        });
+    }
+    Ok(DataIntegrityStatus {
+        reconciled: sources.iter().all(|source| source.reconciled),
+        sources,
     })
 }
 
@@ -1354,10 +2019,10 @@ fn period_start(period: MetricPeriod) -> Option<i64> {
 
 fn load(path: &Path, filters: &AnalyticsFilters) -> AppResult<Vec<Observation>> {
     let conn = db::open(path)?;
-    let mut sql = "SELECT o.source_id,s.name,o.provider,o.model,o.reasoning_effort,o.completed_at_ms,o.duration_ms,o.ttft_ms,o.uncached_input_tokens,o.cached_read_tokens,o.cached_write_tokens,o.output_tokens,o.reasoning_tokens,o.total_tokens,o.estimated_cost_nano_usd,o.priced_tokens,o.pricing_status,o.updated_at FROM usage_observations o JOIN sources s ON s.id=o.source_id WHERE s.enabled=1 AND o.status='completed' AND o.completed_at_ms IS NOT NULL".to_string();
+    let mut sql = "SELECT o.source_id,s.name,o.provider,o.model,o.reasoning_effort,o.occurred_at_ms,o.uncached_input_tokens,o.cached_read_tokens,o.cached_write_tokens,o.output_tokens,o.reasoning_tokens,o.total_tokens,o.estimated_cost_nano_usd,o.priced_tokens,o.pricing_status,o.updated_at FROM model_call_observations o JOIN sources s ON s.id=o.source_id WHERE s.enabled=1 AND o.total_tokens>0".to_string();
     let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     if let Some(start) = period_start(filters.period) {
-        sql.push_str(" AND o.completed_at_ms>=?");
+        sql.push_str(" AND o.occurred_at_ms>=?");
         values.push(Box::new(start));
     }
     if let Some(source_id) = filters.source_id {
@@ -1372,7 +2037,62 @@ fn load(path: &Path, filters: &AnalyticsFilters) -> AppResult<Vec<Observation>> 
         sql.push_str(" AND o.reasoning_effort=?");
         values.push(Box::new(effort.clone()));
     }
-    sql.push_str(" ORDER BY o.completed_at_ms DESC");
+    sql.push_str(" ORDER BY o.occurred_at_ms DESC");
+    if filters.period == MetricPeriod::Realtime {
+        sql.push_str(" LIMIT 10");
+    }
+    let refs = values.iter().map(|v| v.as_ref()).collect::<Vec<_>>();
+    let mut stmt = conn.prepare(&sql).map_err(db::to_error)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(refs), |row| {
+            Ok(Observation {
+                source_id: row.get(0)?,
+                source_name: row.get(1)?,
+                provider: row.get(2)?,
+                model: row.get(3)?,
+                effort: row.get(4)?,
+                completed_at: row.get(5)?,
+                duration_ms: None,
+                ttft_ms: None,
+                tokens: UsageTokens {
+                    uncached_input: row.get(6)?,
+                    cached_read: row.get(7)?,
+                    cached_write: row.get(8)?,
+                    output: row.get(9)?,
+                    reasoning: row.get(10)?,
+                    total: row.get(11)?,
+                },
+                cost: row.get(12)?,
+                priced_tokens: row.get(13)?,
+                pricing_status: row.get(14)?,
+                updated_at: row.get(15)?,
+            })
+        })
+        .map_err(db::to_error)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(db::to_error)
+}
+
+fn load_performance(path: &Path, filters: &AnalyticsFilters) -> AppResult<Vec<Observation>> {
+    let conn = db::open(path)?;
+    let mut sql="SELECT o.source_id,s.name,o.provider,o.model,o.reasoning_effort,o.occurred_at_ms,o.duration_ms,o.ttft_ms,o.output_tokens,o.updated_at FROM performance_observations o JOIN sources s ON s.id=o.source_id WHERE s.enabled=1".to_string();
+    let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if let Some(start) = period_start(filters.period) {
+        sql.push_str(" AND o.occurred_at_ms>=?");
+        values.push(Box::new(start));
+    }
+    if let Some(source_id) = filters.source_id {
+        sql.push_str(" AND o.source_id=?");
+        values.push(Box::new(source_id));
+    }
+    if let Some(model) = filters.model.as_ref().filter(|v| !v.is_empty()) {
+        sql.push_str(" AND o.model=?");
+        values.push(Box::new(model.clone()));
+    }
+    if let Some(effort) = filters.reasoning_effort.as_ref().filter(|v| !v.is_empty()) {
+        sql.push_str(" AND o.reasoning_effort=?");
+        values.push(Box::new(effort.clone()));
+    }
+    sql.push_str(" ORDER BY o.occurred_at_ms DESC");
     if filters.period == MetricPeriod::Realtime {
         sql.push_str(" LIMIT 10");
     }
@@ -1390,17 +2110,14 @@ fn load(path: &Path, filters: &AnalyticsFilters) -> AppResult<Vec<Observation>> 
                 duration_ms: row.get(6)?,
                 ttft_ms: row.get(7)?,
                 tokens: UsageTokens {
-                    uncached_input: row.get(8)?,
-                    cached_read: row.get(9)?,
-                    cached_write: row.get(10)?,
-                    output: row.get(11)?,
-                    reasoning: row.get(12)?,
-                    total: row.get(13)?,
+                    output: row.get(8)?,
+                    total: row.get(8)?,
+                    ..UsageTokens::default()
                 },
-                cost: row.get(14)?,
-                priced_tokens: row.get(15)?,
-                pricing_status: row.get(16)?,
-                updated_at: row.get(17)?,
+                cost: 0,
+                priced_tokens: 0,
+                pricing_status: "performance".into(),
+                updated_at: row.get(9)?,
             })
         })
         .map_err(db::to_error)?;
@@ -1412,14 +2129,35 @@ fn average(values: impl Iterator<Item = f64>) -> Option<f64> {
     (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
 }
 
-fn tps(row: &Observation) -> Option<f64> {
+/// 有效解码窗口下限：小于该值的样本视为计时口径异常，不参与速度统计。
+const MIN_DECODE_MS: i64 = 500;
+
+fn decode_ms(row: &Observation) -> Option<i64> {
     let duration = row.duration_ms?;
     let ttft = row.ttft_ms?;
-    (row.tokens.output > 0 && duration > ttft)
-        .then(|| row.tokens.output as f64 / ((duration - ttft) as f64 / 1000.0))
+    (row.tokens.output > 0 && duration > ttft && duration - ttft >= MIN_DECODE_MS)
+        .then_some(duration - ttft)
 }
 
-fn summarize(period: MetricPeriod, rows: &[Observation]) -> MetricSummary {
+/// 按 Token 加权的有效速度：小分母异常样本不再以算术平均拉高整体。
+fn weighted_tps(rows: &[Observation]) -> Option<f64> {
+    let mut tokens = 0_i64;
+    let mut weighted_sum = 0.0;
+    for row in rows {
+        if let Some(window) = decode_ms(row) {
+            tokens += row.tokens.output;
+            let output = row.tokens.output as f64;
+            weighted_sum += output * (output / (window as f64 / 1000.0));
+        }
+    }
+    (tokens > 0).then(|| weighted_sum / tokens as f64)
+}
+
+fn summarize(
+    period: MetricPeriod,
+    rows: &[Observation],
+    performance: &[Observation],
+) -> MetricSummary {
     let mut tokens = UsageTokens::default();
     for row in rows {
         tokens.uncached_input += row.tokens.uncached_input;
@@ -1441,9 +2179,14 @@ fn summarize(period: MetricPeriod, rows: &[Observation]) -> MetricSummary {
     };
     MetricSummary {
         period,
-        observation_count: rows.len() as i64,
-        average_ttft_ms: average(rows.iter().filter_map(|r| r.ttft_ms.map(|v| v as f64))),
-        average_effective_tps: average(rows.iter().filter_map(tps)),
+        call_count: rows.len() as i64,
+        performance_sample_count: performance.len() as i64,
+        average_ttft_ms: average(
+            performance
+                .iter()
+                .filter_map(|r| r.ttft_ms.map(|v| v as f64)),
+        ),
+        average_effective_tps: weighted_tps(performance),
         tokens,
         estimated_cost_nano_usd: rows.iter().map(|r| r.cost).sum(),
         pricing: PricingCoverage {
@@ -1460,7 +2203,8 @@ fn summarize(period: MetricPeriod, rows: &[Observation]) -> MetricSummary {
 
 pub fn query_metric_summary(path: &Path, filters: AnalyticsFilters) -> AppResult<MetricSummary> {
     let rows = load(path, &filters)?;
-    Ok(summarize(filters.period, &rows))
+    let performance = load_performance(path, &filters)?;
+    Ok(summarize(filters.period, &rows, &performance))
 }
 
 pub fn query_model_effort_stats(
@@ -1468,6 +2212,7 @@ pub fn query_model_effort_stats(
     filters: AnalyticsFilters,
 ) -> AppResult<Vec<ModelEffortStat>> {
     let rows = load(path, &filters)?;
+    let performance = load_performance(path, &filters)?;
     let mut groups: BTreeMap<(i64, String, String, String, String), Vec<Observation>> =
         BTreeMap::new();
     for row in rows {
@@ -1486,14 +2231,25 @@ pub fn query_model_effort_stats(
         .into_iter()
         .map(
             |((source_id, source_name, provider, model, effort), rows)| {
-                let summary = summarize(filters.period, &rows);
+                let perf = performance
+                    .iter()
+                    .filter(|row| {
+                        row.source_id == source_id
+                            && row.provider == provider
+                            && row.model == model
+                            && row.effort == effort
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let summary = summarize(filters.period, &rows, &perf);
                 ModelEffortStat {
                     source_id,
                     source_name,
                     provider,
                     model,
                     reasoning_effort: effort,
-                    observation_count: summary.observation_count,
+                    call_count: summary.call_count,
+                    performance_sample_count: summary.performance_sample_count,
                     average_ttft_ms: summary.average_ttft_ms,
                     average_effective_tps: summary.average_effective_tps,
                     tokens: summary.tokens,
@@ -1542,11 +2298,32 @@ pub fn query_metric_series(
     Ok(groups
         .into_iter()
         .map(|(bucket, (label, rows))| {
-            let s = summarize(filters.period, &rows);
+            let performance = load_performance(path, &filters).unwrap_or_default();
+            let perf = performance
+                .into_iter()
+                .filter(|row| {
+                    let local = Local.timestamp_millis_opt(row.completed_at).single();
+                    match (filters.period, local) {
+                        (MetricPeriod::Realtime, _) => rows
+                            .iter()
+                            .any(|call| call.source_id == row.source_id && call.model == row.model),
+                        (MetricPeriod::Today, Some(v)) => {
+                            v.format("%Y-%m-%d-%H").to_string() == bucket
+                        }
+                        (MetricPeriod::Week | MetricPeriod::Month, Some(v)) => {
+                            v.format("%Y-%m-%d").to_string() == bucket
+                        }
+                        (MetricPeriod::Year, Some(v)) => v.format("%Y-%m").to_string() == bucket,
+                        _ => false,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let s = summarize(filters.period, &rows, &perf);
             MetricSeriesPoint {
                 bucket,
                 label,
-                observation_count: s.observation_count,
+                call_count: s.call_count,
+                performance_sample_count: s.performance_sample_count,
                 average_ttft_ms: s.average_ttft_ms,
                 average_effective_tps: s.average_effective_tps,
                 total_tokens: s.tokens.total,
@@ -1606,6 +2383,30 @@ mod tests {
     }
 
     #[test]
+    fn spark_contributor_rates_match_official_announcement() {
+        let rate = rate_for("muse-spark-1.3-contributor", "2026-09-03").expect("contributor rate");
+        assert_eq!(rate.vendor, "Meta");
+        assert_eq!(rate.model, "muse-spark-1.3");
+        assert_eq!(rate.input, 100_000);
+        assert_eq!(rate.output, 200_000);
+        assert_eq!(rate.cached_read, Some(2_000));
+        assert_eq!(rate.cached_write, None);
+        assert!(rate_for("muse-spark-1.3-contributor", "2026-09-02").is_none());
+    }
+
+    #[test]
+    fn spark_free_alias_prices_like_contributor() {
+        let base = rate_for("muse-spark-1.3-contributor", "2026-09-05").expect("contributor rate");
+        let free =
+            rate_for("muse-spark-1.3-contributor-free", "2026-09-05").expect("free alias rate");
+        assert_eq!(base.model, free.model);
+        assert_eq!(base.input, free.input);
+        assert_eq!(base.output, free.output);
+        assert_eq!(base.cached_read, free.cached_read);
+        assert_eq!(base.effective_from, free.effective_from);
+    }
+
+    #[test]
     fn partial_pricing_keeps_known_cost_and_reports_coverage() {
         let rows = [
             Observation {
@@ -1648,7 +2449,7 @@ mod tests {
                 updated_at: "2026-09-06T00:00:01Z".into(),
             },
         ];
-        let summary = summarize(MetricPeriod::Today, &rows);
+        let summary = summarize(MetricPeriod::Today, &rows, &[]);
         assert_eq!(summary.estimated_cost_nano_usd, 1_000);
         assert_eq!(summary.pricing.ratio, 0.5);
         assert!(!summary.pricing.complete);
@@ -1691,6 +2492,8 @@ mod tests {
             )
             .unwrap();
         }
+        materialize_observations(&conn).unwrap();
+        reprice_conn(&conn).unwrap();
         drop(conn);
         let summary = query_metric_summary(
             &path,
@@ -1700,9 +2503,52 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(summary.observation_count, 10);
+        assert_eq!(summary.call_count, 10);
+        assert_eq!(summary.performance_sample_count, 10);
         assert_eq!(summary.tokens.total, 200);
         assert_eq!(summary.average_effective_tps, Some(10.0));
+    }
+
+    fn observation(output: i64, duration_ms: i64, ttft_ms: i64) -> Observation {
+        Observation {
+            source_id: 1,
+            source_name: "Fixture".into(),
+            provider: "omlx".into(),
+            model: "Qwen-fixture".into(),
+            effort: "default".into(),
+            completed_at: 1,
+            duration_ms: Some(duration_ms),
+            ttft_ms: Some(ttft_ms),
+            tokens: UsageTokens {
+                output,
+                total: output,
+                ..Default::default()
+            },
+            cost: 0,
+            priced_tokens: 0,
+            pricing_status: "unpriced".into(),
+            updated_at: "2026-09-06T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn tiny_decode_windows_are_excluded_from_tps() {
+        let rows = vec![
+            observation(4_120, 22_816, 22_806),
+            observation(1_000, 3_000, 1_000),
+        ];
+        let summary = summarize(MetricPeriod::Today, &[], &rows);
+        assert_eq!(summary.average_effective_tps, Some(500.0));
+    }
+
+    #[test]
+    fn average_tps_is_token_weighted_not_arithmetic() {
+        let rows = vec![
+            observation(100, 11_000, 1_000),
+            observation(900, 31_000, 1_000),
+        ];
+        let summary = summarize(MetricPeriod::Today, &[], &rows);
+        assert_eq!(summary.average_effective_tps, Some(28.0));
     }
 
     #[test]
@@ -1870,5 +2716,81 @@ mod tests {
             |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
         ).unwrap();
         assert_eq!(row, (1, "call-1".into(), 100, 30, 150, None));
+    }
+
+    #[test]
+    fn codex_calls_use_response_ids_before_parent_turn_completes() {
+        let (_temp, path) = empty_meter();
+        let conn = db::open(&path).unwrap();
+        conn.execute("INSERT INTO sources(id,name,root_path,source_kind,enabled) VALUES (300,'Codex','/fixture','codex_jsonl',1)",[]).unwrap();
+        for (turn, status, completed) in [
+            ("turn-primary", "running", None),
+            ("turn-legacy", "completed", Some("2026-09-07T08:00:04Z")),
+        ] {
+            conn.execute("INSERT INTO turns(turn_id,session_id,source_id,started_at,started_local_date,completed_at,duration_ms,ttft_ms,model,reasoning_effort,status,updated_at) VALUES (?1,'session',300,'2026-09-07T08:00:00Z','2026-09-07',?2,4000,1000,'gpt-6-astra','medium',?3,'2026-09-07T08:00:04Z')",params![turn,completed,status]).unwrap();
+        }
+        let calls = [
+            ("legacy-shadow", "turn-primary", "legacy", 80, 20, 10, 110),
+            ("response-1", "turn-primary", "primary", 80, 20, 20, 120),
+            ("response-2", "turn-primary", "primary", 150, 50, 30, 230),
+            ("zero-heartbeat", "turn-primary", "primary", 0, 0, 0, 0),
+            ("legacy-only", "turn-legacy", "legacy", 40, 10, 10, 60),
+        ];
+        for (id, turn, kind, input, cache, output, total) in calls {
+            conn.execute("INSERT INTO model_calls(response_id,turn_id,session_id,occurred_at,call_kind,input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,total_tokens) VALUES (?1,?2,'session','2026-09-07T08:00:02Z',?3,?4,?5,?6,0,?7)",params![id,turn,kind,input,cache,output,total]).unwrap();
+        }
+        materialize_observations(&conn).unwrap();
+        reprice_conn(&conn).unwrap();
+        let (count,total,cost):(i64,i64,i64)=conn.query_row("SELECT count(*),sum(total_tokens),sum(estimated_cost_nano_usd) FROM model_call_observations WHERE source_id=300",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        assert_eq!((count, total), (3, 410));
+        assert!(cost > 0);
+        let performance: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM performance_observations WHERE source_id=300",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(performance, 1);
+    }
+
+    #[test]
+    fn pricing_crud_preserves_blank_cache_and_deleted_seed() {
+        let (_temp, path) = empty_meter();
+        let input = PricingRateInput {
+            vendor: "Test".into(),
+            model: "custom-model".into(),
+            aliases: vec!["custom-alias".into()],
+            input_usd_per_million: "1".into(),
+            cached_read_usd_per_million: None,
+            cached_write_usd_per_million: Some("0".into()),
+            output_usd_per_million: "2".into(),
+            effective_from: "2026-01-01".into(),
+            effective_to: None,
+            source_url: "https://example.com/price".into(),
+        };
+        let created = create_pricing_rate(&path, input.clone()).unwrap();
+        assert_eq!(created.cached_read_usd_per_million, None);
+        assert_eq!(created.cached_write_usd_per_million, Some("0".into()));
+        let overlapping = create_pricing_rate(
+            &path,
+            PricingRateInput {
+                effective_from: "2026-06-01".into(),
+                ..input.clone()
+            },
+        );
+        assert!(overlapping.is_err());
+        let astra_id = pricing_catalog_status(&path)
+            .unwrap()
+            .rates
+            .into_iter()
+            .find(|rate| rate.model == "gpt-6-astra")
+            .unwrap()
+            .id;
+        delete_pricing_rate(&path, astra_id).unwrap();
+        let conn = db::open(&path).unwrap();
+        seed_pricing_rates(&conn).unwrap();
+        let restored:i64=conn.query_row("SELECT count(*) FROM pricing_rates WHERE model='gpt-6-astra' AND deleted_at IS NULL",[],|row|row.get(0)).unwrap();
+        assert_eq!(restored, 0);
     }
 }

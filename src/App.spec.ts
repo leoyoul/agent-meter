@@ -23,9 +23,23 @@ describe('Agent Meter v0.4 windows', () => {
     await vi.waitFor(() => expect(wrapper.findAll('.source-tab')).toHaveLength(7))
     expect(wrapper.findAll('.source-tab').map(tab => tab.text())).toEqual(['全部', 'Codex', 'ZCode', 'OpenCode', 'DSH', 'Claude', 'EvoX'])
     expect(wrapper.find('select option').text()).toBe('全部模型')
+    expect(wrapper.findAll('.view-tabs button').map(button => button.text())).toEqual(['分析', '价格'])
     expect(wrapper.text()).toContain('来源 × 模型 × 推理强度')
     expect(wrapper.text()).not.toContain('主代理与子代理')
     expect(wrapper.text()).not.toContain('任务明细')
+    wrapper.unmount()
+  })
+
+  it('lists used models and opens the pricing editor', async () => {
+    const wrapper = mount(App)
+    await vi.waitFor(() => expect(wrapper.findAll('.view-tabs button')).toHaveLength(2))
+    await wrapper.findAll('.view-tabs button')[1].trigger('click')
+    await vi.waitFor(() => expect(wrapper.text()).toContain('gpt-6-astra'))
+    expect(wrapper.text()).toContain('unpriced-model')
+    const add = wrapper.findAll('button').find(button => button.text().includes('新增价格'))!
+    await add.trigger('click')
+    expect(wrapper.find('.price-editor').exists()).toBe(true)
+    expect(wrapper.text()).toContain('空白表示该桶未计价')
     wrapper.unmount()
   })
 
@@ -61,6 +75,10 @@ describe('Agent Meter v0.4 windows', () => {
       await wrapper.get(selector).trigger('click')
       await vi.waitFor(() => expect(wrapper.get(selector).attributes('aria-checked')).toBe('true'))
     }
+    const iconSwitch = 'button[aria-label="切换应用图标显示"]'
+    expect(wrapper.get(iconSwitch).attributes('aria-checked')).toBe('false')
+    await wrapper.get(iconSwitch).trigger('click')
+    await vi.waitFor(() => expect(wrapper.get(iconSwitch).attributes('aria-checked')).toBe('true'))
     expect(wrapper.text()).toContain('未发现可统计的本地 Token 记录')
     expect(wrapper.text()).toContain('数据只留在本机')
     wrapper.unmount()

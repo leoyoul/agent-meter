@@ -7,9 +7,9 @@ mod settings;
 
 use importer::BackendState;
 use models::{
-    AnalyticsFilters, ImportStatus, MetricFilters, MetricSeriesPoint, MetricSummary,
-    ModelEffortStat, ModelStat, Overview, PricingCatalogStatus, SourceInfo, TaskRow,
-    TimeseriesPoint,
+    AnalyticsFilters, DataIntegrityStatus, ImportStatus, MetricFilters, MetricSeriesPoint,
+    MetricSummary, ModelEffortStat, ModelStat, Overview, PricingCatalogStatus, PricingModel,
+    PricingRate, PricingRateInput, SourceInfo, TaskRow, TimeseriesPoint,
 };
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use settings::{AppSettings, SettingsState};
@@ -118,6 +118,52 @@ fn get_pricing_catalog_status(
 #[tauri::command]
 fn reprice_usage(state: State<'_, BackendState>) -> Result<PricingCatalogStatus, String> {
     analytics::reprice_usage(&state.db_path)
+}
+
+#[tauri::command]
+fn get_data_integrity_status(
+    state: State<'_, BackendState>,
+) -> Result<DataIntegrityStatus, String> {
+    analytics::get_data_integrity_status(&state.db_path)
+}
+
+#[tauri::command]
+fn list_pricing_models(state: State<'_, BackendState>) -> Result<Vec<PricingModel>, String> {
+    analytics::list_pricing_models(&state.db_path)
+}
+
+#[tauri::command]
+fn create_pricing_rate(
+    app: AppHandle,
+    state: State<'_, BackendState>,
+    input: PricingRateInput,
+) -> Result<PricingRate, String> {
+    let rate = analytics::create_pricing_rate(&state.db_path, input)?;
+    let _ = app.emit("metrics-updated", db::database_last_updated(&state.db_path));
+    Ok(rate)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn update_pricing_rate(
+    app: AppHandle,
+    state: State<'_, BackendState>,
+    id: i64,
+    input: PricingRateInput,
+) -> Result<PricingRate, String> {
+    let rate = analytics::update_pricing_rate(&state.db_path, id, input)?;
+    let _ = app.emit("metrics-updated", db::database_last_updated(&state.db_path));
+    Ok(rate)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn delete_pricing_rate(
+    app: AppHandle,
+    state: State<'_, BackendState>,
+    id: i64,
+) -> Result<(), String> {
+    analytics::delete_pricing_rate(&state.db_path, id)?;
+    let _ = app.emit("metrics-updated", db::database_last_updated(&state.db_path));
+    Ok(())
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -267,7 +313,33 @@ fn sync_metric_trays(app: &AppHandle, settings: &AppSettings) -> Result<(), Stri
     for (id, enabled, title, tooltip) in metric_tray_specs(settings) {
         sync_metric_tray(app, enabled, id, title, tooltip)?;
     }
+    sync_app_tray(app, settings)?;
     Ok(())
+}
+
+/// 主应用图标默认隐藏；当所有指标都关闭时强制保留，否则设置将无入口。
+fn sync_app_tray(app: &AppHandle, settings: &AppSettings) -> Result<(), String> {
+    let any_metric = metric_tray_specs(settings).iter().any(|spec| spec.1);
+    let visible = settings.show_app_icon || !any_metric;
+    match (visible, app.tray_by_id("agent-meter-tray")) {
+        (true, None) => {
+            let menu = tray_menu(app).map_err(|error| error.to_string())?;
+            let mut builder = TrayIconBuilder::with_id("agent-meter-tray")
+                .tooltip("Agent Meter")
+                .menu(&menu)
+                .show_menu_on_left_click(false);
+            if let Some(icon) = app.default_window_icon() {
+                builder = builder.icon(icon.clone()).icon_as_template(true);
+            }
+            builder.build(app).map_err(|error| error.to_string())?;
+            Ok(())
+        }
+        (false, Some(_)) => {
+            app.remove_tray_by_id("agent-meter-tray");
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 fn metric_tray_specs(
@@ -297,15 +369,6 @@ fn metric_tray_specs(
 }
 
 fn setup_trays(app: &tauri::App, settings: &AppSettings) -> tauri::Result<()> {
-    let menu = tray_menu(app.handle())?;
-    let mut builder = TrayIconBuilder::with_id("agent-meter-tray")
-        .tooltip("Agent Meter")
-        .menu(&menu)
-        .show_menu_on_left_click(false);
-    if let Some(icon) = app.default_window_icon() {
-        builder = builder.icon(icon.clone()).icon_as_template(true);
-    }
-    builder.build(app)?;
     sync_metric_trays(app.handle(), settings).map_err(std::io::Error::other)?;
 
     app.on_tray_icon_event(|tray, event| {
@@ -590,6 +653,11 @@ pub fn run() {
             query_model_effort_stats,
             get_pricing_catalog_status,
             reprice_usage,
+            get_data_integrity_status,
+            list_pricing_models,
+            create_pricing_rate,
+            update_pricing_rate,
+            delete_pricing_rate,
             update_source,
             get_app_settings,
             update_app_settings,

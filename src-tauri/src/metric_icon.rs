@@ -2,7 +2,7 @@ use ab_glyph::{point, Font, FontVec, ScaleFont};
 use std::sync::OnceLock;
 use tauri::image::Image;
 
-const WIDTH: usize = 76;
+const WIDTH: usize = 60;
 const HEIGHT: usize = 44;
 
 fn load_font(path: &str, collection_index: u32) -> Option<FontVec> {
@@ -79,13 +79,13 @@ pub fn render(label: &str, value: &str) -> Image<'static> {
             &mut alpha,
             font,
             value,
-            fitted_size(font, value, 29.0, 22.0),
+            fitted_size(font, value, 25.0, 17.0),
             -3.5,
             true,
         );
     }
     if let Some(font) = label_font() {
-        draw_centered(&mut alpha, font, label, 15.0, 28.0, true);
+        draw_centered(&mut alpha, font, label, 13.0, 28.0, true);
     }
     let mut rgba = Vec::with_capacity(WIDTH * HEIGHT * 4);
     for opacity in alpha {

@@ -59,7 +59,8 @@ pub struct PricingCoverage {
 #[serde(rename_all = "camelCase")]
 pub struct MetricSummary {
     pub period: MetricPeriod,
-    pub observation_count: i64,
+    pub call_count: i64,
+    pub performance_sample_count: i64,
     pub average_ttft_ms: Option<f64>,
     pub average_effective_tps: Option<f64>,
     pub tokens: UsageTokens,
@@ -73,7 +74,8 @@ pub struct MetricSummary {
 pub struct MetricSeriesPoint {
     pub bucket: String,
     pub label: String,
-    pub observation_count: i64,
+    pub call_count: i64,
+    pub performance_sample_count: i64,
     pub average_ttft_ms: Option<f64>,
     pub average_effective_tps: Option<f64>,
     pub total_tokens: i64,
@@ -88,7 +90,8 @@ pub struct ModelEffortStat {
     pub provider: String,
     pub model: String,
     pub reasoning_effort: String,
-    pub observation_count: i64,
+    pub call_count: i64,
+    pub performance_sample_count: i64,
     pub average_ttft_ms: Option<f64>,
     pub average_effective_tps: Option<f64>,
     pub tokens: UsageTokens,
@@ -99,6 +102,7 @@ pub struct ModelEffortStat {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PricingRate {
+    pub id: i64,
     pub vendor: String,
     pub model: String,
     pub aliases: Vec<String>,
@@ -111,6 +115,57 @@ pub struct PricingRate {
     pub effective_to: Option<String>,
     pub source_url: String,
     pub verified_at: String,
+    pub origin: String,
+    pub call_count: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PricingRateInput {
+    pub vendor: String,
+    pub model: String,
+    pub aliases: Vec<String>,
+    pub input_usd_per_million: String,
+    pub cached_read_usd_per_million: Option<String>,
+    pub cached_write_usd_per_million: Option<String>,
+    pub output_usd_per_million: String,
+    pub effective_from: String,
+    pub effective_to: Option<String>,
+    pub source_url: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PricingModel {
+    pub vendor: String,
+    pub model: String,
+    pub call_count: i64,
+    pub total_tokens: i64,
+    pub pricing_status: String,
+    pub rates: Vec<PricingRate>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceIntegrityStatus {
+    pub source_id: i64,
+    pub source_name: String,
+    pub raw_call_count: i64,
+    pub indexed_call_count: i64,
+    pub difference: i64,
+    pub unread_bytes: i64,
+    pub parse_error_count: i64,
+    pub last_call_at: Option<String>,
+    pub sync_delay_ms: Option<i64>,
+    pub reconciled: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataIntegrityStatus {
+    pub reconciled: bool,
+    pub sources: Vec<SourceIntegrityStatus>,
 }
 
 #[derive(Debug, Clone, Serialize)]

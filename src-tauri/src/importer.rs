@@ -11,7 +11,7 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 use walkdir::WalkDir;
 
@@ -121,6 +121,7 @@ fn run_import(app: &AppHandle, state: &BackendState) -> AppResult<()> {
         let _ = app.emit("import-progress", status.clone());
     }
 
+    let mut last_metrics_emit = Instant::now() - Duration::from_secs(1);
     for (index, file) in files.iter().enumerate() {
         if state.paused.load(Ordering::Acquire) {
             break;
@@ -142,6 +143,14 @@ fn run_import(app: &AppHandle, state: &BackendState) -> AppResult<()> {
             let _ = app.emit("import-progress", status.clone());
         }) {
             Ok(offset) => {
+                if offset > before {
+                    crate::analytics::sync_codex_incremental(&conn)?;
+                    if last_metrics_emit.elapsed() >= Duration::from_millis(300) {
+                        let _ =
+                            app.emit("metrics-updated", db::database_last_updated(&state.db_path));
+                        last_metrics_emit = Instant::now();
+                    }
+                }
                 let mut status = state.status.lock();
                 status.bytes_done = status
                     .bytes_done
@@ -205,7 +214,15 @@ fn collect_files(db_path: &Path) -> AppResult<Vec<FileEntry>> {
             });
         }
     }
-    result.sort_by(|a, b| a.path.cmp(&b.path));
+    let conn = db::open(db_path)?;
+    result.sort_by(|a, b| {
+        let a_unread = existing_offset(&conn, a).unwrap_or(0) < a.size;
+        let b_unread = existing_offset(&conn, b).unwrap_or(0) < b.size;
+        b_unread
+            .cmp(&a_unread)
+            .then_with(|| b.mtime_ms.cmp(&a.mtime_ms))
+            .then_with(|| a.path.cmp(&b.path))
+    });
     Ok(result)
 }
 
@@ -313,6 +330,11 @@ fn scan_file(
             }
             Err(_) => {
                 // A malformed complete JSONL record is skipped without retaining its contents.
+                conn.execute(
+                    "UPDATE scan_files SET parse_error_count=parse_error_count+1 WHERE path=?1",
+                    params![path_text],
+                )
+                .map_err(db::to_error)?;
                 cursor.offset = record_end;
                 last_committed_offset = record_end;
             }
@@ -580,7 +602,7 @@ fn reset_file_data(conn: &Connection, path: &str) -> AppResult<()> {
     conn.execute(
         "UPDATE scan_files SET offset=0, current_session_id=NULL, current_turn_id=NULL,
                 last_input=0, last_cached_input=0, last_output=0,
-                last_reasoning=0, last_total=0 WHERE path=?1",
+                last_reasoning=0, last_total=0, parse_error_count=0 WHERE path=?1",
         params![path],
     )
     .map_err(db::to_error)?;

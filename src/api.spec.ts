@@ -1,5 +1,9 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { meterApi } from './api'
+
+const invokeMock = vi.hoisted(() => vi.fn())
+
+vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeMock }))
 
 describe('browser mock API v0.4', () => {
   it('returns the four-metric contract', async () => {
@@ -9,8 +13,9 @@ describe('browser mock API v0.4', () => {
     expect(summary.averageTtftMs).toBeGreaterThan(0)
     expect(summary.averageEffectiveTps).toBeGreaterThan(0)
     expect(summary.estimatedCostNanoUsd).toBeGreaterThan(0)
+    expect(summary.callCount).toBeGreaterThan(summary.performanceSampleCount)
     expect(series).toHaveLength(10)
-    expect(new Set(matrix.map(row => row.sourceName))).toEqual(new Set(['Codex', 'ZCode', 'OpenCode', 'DSH', 'EvoX']))
+    expect(new Set(matrix.map(row => row.sourceName))).toEqual(new Set(['Codex', 'ZCode', 'OpenCode']))
   })
 
   it('filters by source, model and effort', async () => {
@@ -25,6 +30,16 @@ describe('browser mock API v0.4', () => {
     const catalog = await meterApi.getPricingCatalogStatus()
     expect(catalog.version).toMatch(/^\d{4}-\d{2}-\d{2}/)
     expect(catalog.rates.every(rate => rate.sourceUrl.startsWith('https://'))).toBe(true)
+  })
+
+  it('supports pricing CRUD and data integrity status', async () => {
+    const before = await meterApi.listPricingModels()
+    expect(before.some(model => model.model === 'unpriced-model')).toBe(true)
+    const created = await meterApi.createPricingRate({ vendor: 'Test', model: 'new-model', aliases: [], inputUsdPerMillion: '1', cachedReadUsdPerMillion: null, cachedWriteUsdPerMillion: '0', outputUsdPerMillion: '2', effectiveFrom: '2026-09-07', effectiveTo: null, sourceUrl: 'https://example.com' })
+    expect(created.cachedReadUsdPerMillion).toBeNull()
+    expect(created.cachedWriteUsdPerMillion).toBe('0')
+    await meterApi.deletePricingRate(created.id)
+    expect((await meterApi.getDataIntegrityStatus()).reconciled).toBe(true)
   })
 
   it('persists fee visibility and shared period', async () => {
@@ -50,5 +65,15 @@ describe('browser mock API v0.4', () => {
     await meterApi.updateSource(source.id, true)
     expect((await meterApi.startImport(true)).message).toContain('重建')
     expect((await meterApi.pauseImport()).paused).toBe(true)
+  })
+
+  it('uses the Tauri camelCase sourceId argument', async () => {
+    Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {}, configurable: true })
+    invokeMock.mockResolvedValue({ id: 7, enabled: false })
+
+    await meterApi.updateSource(7, false)
+
+    expect(invokeMock).toHaveBeenCalledWith('update_source', { sourceId: 7, enabled: false })
+    delete (window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__
   })
 })

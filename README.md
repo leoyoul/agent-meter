@@ -11,25 +11,28 @@ Agent Meter 是一个本地优先的 macOS 菜单栏应用，用“速、首、�
 
 ## 功能
 
-- 菜单栏提供四个独立的 `38×22pt` 双行状态项，大数值在上、指标名在下，每项固定宽度并可单独开关；应用图标始终保留。
+- 菜单栏提供四个独立的 `30×22pt` 双行状态项，大数值在上、指标名在下，每项固定宽度并可单独开关；应用图标默认隐藏，可在设置中打开。
 - 仪表盘使用顶层来源标签；当前来源同步用于仪表盘和菜单栏，重启后保持选择。
 - 仪表盘和设置是标准 macOS 窗口，打开时出现在 Dock 与 `⌘Tab`，关闭后继续在菜单栏后台运行。
 - 实时、今日、本周、本月和本年五个统一统计周期。
 - 按来源、模型和推理强度查看有效 TPS、首响、Token 与 API 等价费用。
+- 每个完成且 Token 大于零的模型响应按稳定调用 ID 单独计数；运行中任务已经产生的响应也会立即进入用量统计。
+- 仪表盘提供统计可信度对账状态，并在“价格”页管理所有历史使用模型的价格版本。
 - Token 使用互不重叠的非缓存输入、缓存读取、缓存写入和输出计量桶；推理 Token 是输出子集。
 - Codex 使用流式 JSONL 增量索引，ZCode 与 OpenCode 只读其 SQLite 数据库；DSH 流式解压 JSONL zstd，EvoX 只读 observability JSONL。
 - 支持暂停、断点续扫、数据源启停、重建 Codex 索引、登录启动和应用内稳定版更新。
 
 ## 指标口径
 
-- `速`：`output_tokens / ((duration_ms - ttft_ms) / 1000)`。包含思考、工具等待和同一轮内多次模型调用，不代表服务端纯解码速度。
+- `调用`：一条完成且 Token 大于零的模型响应算一次；Codex 使用唯一 `response_id`，不再用 turn 数代替调用数。
+- `速`：单个可靠性能样本为 `output_tokens / ((duration_ms - ttft_ms) / 1000)`，多样本取 Token 加权平均；解码窗口小于 500ms 的异常样本不参与统计。性能样本数与调用数独立展示。
 - `首`：开始到首个内容 Token 的时间。缺少首内容时间的历史记录不参与平均，不用总耗时代替。
 - `量`：`非缓存输入 + 缓存读取 + 缓存写入 + 输出`。推理 Token 不重复计数。
 - `费`：按调用日期对应的厂商官方标准文本 API 单价计算，使用整数 nano-USD 汇总。
 
-实时周期取最近 10 个有效 observation：速和首取算术平均，量和费取累加值。其他周期以本机时区的自然日、周一、月初和年初为边界。
+实时周期的调用、量和费取最近 10 次模型响应，速和首独立取最近 10 个可靠性能样本。其他周期按每次调用自己的发生时间转换到本机时区，以自然日、周一、月初和年初为边界。
 
-费用是 API 等价估算，不是 Codex 订阅、第三方套餐或实际账单。价目随应用版本发布，不在运行时抓取网页；未知价格不会按零处理，而是显示已知费用和计价覆盖率。当前目录的官方来源包括 [OpenAI 模型文档](https://developers.openai.com/api/docs/models/gpt-5.6-sol)、[MiniMax 按量价格](https://platform.minimax.io/docs/guides/pricing-paygo) 和 [DeepSeek 定价](https://api-docs.deepseek.com/quick_start/pricing)。
+费用是 API 等价估算，不是 Codex 订阅、第三方套餐或实际账单。内置价目首次迁入本机 SQLite 后可直接增删改查，并按生效日期保留历史版本；删除预置版本后升级不会自动恢复。缓存价格空白表示该桶未计价，显式 `0` 表示免费。未知价格不会按零处理，而是显示已知费用和计价覆盖率。当前目录的官方来源包括 [OpenAI GPT-6 Astra 模型文档](https://developers.openai.com/api/docs/models/gpt-6-astra)、[OpenAI 模型文档](https://developers.openai.com/api/docs/models/gpt-5.6-sol)、[Vercel AI Gateway Muse Spark 1.3 公告](https://vercel.com/changelog/muse-spark-1-3-now-available-on-ai-gateway)、[MiniMax 按量价格](https://platform.minimax.io/docs/guides/pricing-paygo) 和 [DeepSeek 定价](https://api-docs.deepseek.com/quick_start/pricing)。
 
 ## 隐私边界
 
@@ -49,7 +52,7 @@ Agent Meter 是一个本地优先的 macOS 菜单栏应用，用“速、首、�
 | Claude Desktop | `~/Library/Application Support/Claude` | 仅检测；未发现稳定的本地 Token 日志 |
 | EvoX | `~/.evox/agent/observability/*.jsonl` | 文件变化与稳定调用 ID 去重 |
 
-应用不会扫描 ZCode 的完整目录，也不会读取 Claude 的 IndexedDB、Cache、Cookies 或对话正文；已经迁移到统一 observation 层的 Codex 历史无需重新导入。
+应用不会扫描 ZCode 的完整目录，也不会读取 Claude 的 IndexedDB、Cache、Cookies 或对话正文。用量调用与性能样本分表保存，Codex 活动目录与归档目录继续按 `response_id` 去重。
 
 ## 安装
 
