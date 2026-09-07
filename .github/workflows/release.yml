@@ -49,6 +49,16 @@ jobs:
           prerelease: false
           includeUpdaterJson: true
           args: --target aarch64-apple-darwin
+      - name: Verify macOS bundle signature
+        run: |
+          APP_PATH="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Agent Meter.app"
+          DMG_PATH="$(find src-tauri/target/aarch64-apple-darwin/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)"
+          MOUNT_DIR="$(mktemp -d)/mount"
+          mkdir "$MOUNT_DIR"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          hdiutil attach "$DMG_PATH" -nobrowse -readonly -mountpoint "$MOUNT_DIR"
+          trap 'hdiutil detach "$MOUNT_DIR"' EXIT
+          codesign --verify --deep --strict --verbose=2 "$MOUNT_DIR/Agent Meter.app"
       - name: Upload DMG checksum
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
