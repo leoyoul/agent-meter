@@ -32,7 +32,7 @@ Agent Meter 是一个本地优先的 macOS 菜单栏应用，用“速、首、�
 
 实时周期的调用、量和费取最近 10 次模型响应，速和首独立取最近 10 个可靠性能样本。其他周期按每次调用自己的发生时间转换到本机时区，以自然日、周一、月初和年初为边界。
 
-费用是 API 等价估算，不是 Codex 订阅、第三方套餐或实际账单。内置价目首次迁入本机 SQLite 后可直接增删改查，并按生效日期保留历史版本；删除预置版本后升级不会自动恢复。缓存价格空白表示该桶未计价，显式 `0` 表示免费。未知价格不会按零处理，而是显示已知费用和计价覆盖率。当前目录的官方来源包括 [OpenAI GPT-6 Astra 模型文档](https://developers.openai.com/api/docs/models/gpt-6-astra)、[OpenAI 模型文档](https://developers.openai.com/api/docs/models/gpt-5.6-sol)、[Vercel AI Gateway Muse Spark 1.3 公告](https://vercel.com/changelog/muse-spark-1-3-now-available-on-ai-gateway)、[MiniMax 按量价格](https://platform.minimax.io/docs/guides/pricing-paygo) 和 [DeepSeek 定价](https://api-docs.deepseek.com/quick_start/pricing)。
+费用是 API 等价估算，不是 Codex 订阅、第三方套餐或实际账单。内置价目首次迁入本机 SQLite 后可直接增删改查，并按生效日期保留历史版本；删除预置版本后升级不会自动恢复。缓存价格空白表示该桶未计价，显式 `0` 表示免费。未知价格不会按零处理，而是显示已知费用和计价覆盖率。当前目录的官方来源包括 [OpenAI GPT-6 Astra 模型文档](https://developers.openai.com/api/docs/models/gpt-6-astra)、[OpenAI 模型文档](https://developers.openai.com/api/docs/models/gpt-5.6-sol)、[Vercel AI Gateway Muse Spark 1.3 公告](https://vercel.com/changelog/muse-spark-1-3-now-available-on-ai-gateway)、[Muse Spark 1.2 Contributor](https://vercel.com/ai-gateway/models/muse-spark-1.2-contributor/about)、[Xiaomi MiMo V2.5](https://vercel.com/ai-gateway/models/mimo-v2.5/about)、[Tencent HY3](https://vercel.com/ai-gateway/models/hy3/about)、[Z.AI GLM-5.3 Flash](https://vercel.com/ai-gateway/models/glm-5.3-flash)、[MiniMax 按量价格](https://platform.minimax.io/docs/guides/pricing-paygo) 和 [DeepSeek 定价](https://api-docs.deepseek.com/quick_start/pricing)。
 
 ## 隐私边界
 
@@ -90,3 +90,7 @@ npm run tauri -- build --target aarch64-apple-darwin
 ## License
 
 [MIT](LICENSE) © 2026 LeoY
+
+### Claude Desktop 数据边界
+
+当前检查的 Claude Desktop 版本未发现可验证的公开 Token 用量记录，因此仍标记为不可统计。应用不会读取 IndexedDB、Cache、Cookies、会话存储或对话正文，也不会从字段字符串推断用量或拦截网络请求。Claude Desktop Token 解析器尚未实现；本版本不宣称支持其 Token 统计。

@@ -170,6 +170,16 @@ pub struct DataIntegrityStatus {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct DashboardData {
+    pub summary: MetricSummary,
+    pub series: Vec<MetricSeriesPoint>,
+    pub stats: Vec<ModelEffortStat>,
+    pub import_status: ImportStatus,
+    pub integrity: DataIntegrityStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PricingCatalogStatus {
     pub version: String,
     pub currency: String,

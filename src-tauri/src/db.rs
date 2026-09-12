@@ -246,6 +246,8 @@ pub fn discover_sources(path: &Path) -> AppResult<Vec<SourceInfo>> {
         };
         let (file_count, total_bytes) = if source_kind == "codex_jsonl" {
             source_inventory(source_path)
+        } else if source_kind == "claude_desktop" {
+            (0, 0)
         } else if source_kind == "dsh_zstd" {
             extension_inventory(source_path, "zstd")
         } else if source_kind == "evox_observability" {
@@ -271,8 +273,10 @@ pub fn discover_sources(path: &Path) -> AppResult<Vec<SourceInfo>> {
             } else {
                 "metrics".into()
             },
-            limitation: if source_kind == "claude_desktop" {
-                Some("未发现可统计的本地 Token 记录".into())
+            limitation: if source_kind == "claude_desktop" && file_count == 0 {
+                Some("未发现可统计的本地 Token 记录；当前版本可能未暴露公开用量日志".into())
+            } else if source_kind == "claude_desktop" {
+                None
             } else {
                 None
             },

@@ -23,7 +23,7 @@ button, select { font: inherit; color: inherit; } button { cursor: pointer; }
 .app-shell { width: min(1480px, 100%); min-height: 100vh; margin: 0 auto; padding: 22px 28px 46px; }
 .topbar, .brand, .header-actions, .panel-heading, .source-row, .card-heading, .inline-result { display: flex; align-items: center; }
 .topbar { justify-content: space-between; min-height: 52px; margin-bottom: 16px; }
-.brand { gap: 11px; }.brand-mark { width: 38px; height: 38px; display: grid; place-items: center; border-radius: 8px; color: white; background: linear-gradient(145deg,#6680d8,#4058b7); box-shadow: 0 7px 17px rgba(64,88,183,.25); }
+.brand { gap: 11px; }.brand-mark { width: 38px; height: 38px; display: grid; place-items: center; }.brand-mark img { width: 100%; height: 100%; display: block; }
 .brand strong { display: block; font-size: 17px; }.brand span { display: block; margin-top: 2px; color: var(--muted); font-size: 12px; }
 .header-actions { gap: 8px; }.freshness { display: flex; align-items: center; gap: 7px; margin-right: 4px; color: var(--muted); font-size: 12px; }.freshness i, .coverage i { width: 7px; height: 7px; border-radius: 50%; background: #8994a0; }.freshness i.live { background: var(--green); box-shadow: 0 0 0 4px rgba(39,133,101,.13); }
 .icon-button { width: 37px; height: 37px; display: grid; place-items: center; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); backdrop-filter: blur(18px) saturate(145%); box-shadow: inset 0 1px rgba(255,255,255,.55); }.icon-button:hover { border-color: rgba(77,101,199,.42); }
@@ -92,7 +92,7 @@ button, select { font: inherit; color: inherit; } button { cursor: pointer; }
 .search-box input, .form-grid input { width: 100%; min-width: 0; border: 0; outline: 0; color: var(--text); background: transparent; font: inherit; }
 .pricing-table { padding-bottom: 10px; }
 .pricing-table table { min-width: 1040px; }
-.unpriced { color: #b26d20; font-weight: 700; }
+.unpriced { color: #b26d20; font-weight: 700; }.pricing-reason { display: block; margin-top: 4px; max-width: 340px; color: var(--muted); line-height: 1.4; }
 .row-actions { display: flex; gap: 5px; }
 .icon-button.compact { width: 29px; height: 29px; min-height: 29px; }
 .modal-backdrop { position: fixed; z-index: 30; inset: 0; display: grid; place-items: center; padding: 18px; background: rgba(14,20,28,.38); backdrop-filter: blur(8px); }

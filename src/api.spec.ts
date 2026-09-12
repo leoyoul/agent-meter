@@ -18,6 +18,15 @@ describe('browser mock API v0.4', () => {
     expect(new Set(matrix.map(row => row.sourceName))).toEqual(new Set(['Codex', 'ZCode', 'OpenCode']))
   })
 
+  it('returns the dashboard metrics in one aggregate payload', async () => {
+    const dashboard = await meterApi.queryDashboard({ period: 'realtime' })
+    expect(dashboard.summary.tokens.total).toBeGreaterThan(0)
+    expect(dashboard.series).toHaveLength(10)
+    expect(dashboard.stats).toHaveLength(3)
+    expect(dashboard.importStatus.filesTotal).toBeGreaterThan(0)
+    expect(dashboard.integrity.reconciled).toBe(true)
+  })
+
   it('filters by source, model and effort', async () => {
     const rows = await meterApi.queryModelEffortStats({ period: 'today', sourceId: 2, model: 'Qwen3.8-27B-MLX-4bit', reasoningEffort: 'default' })
     expect(rows).toHaveLength(1)

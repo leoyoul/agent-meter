@@ -7,9 +7,9 @@ mod settings;
 
 use importer::BackendState;
 use models::{
-    AnalyticsFilters, DataIntegrityStatus, ImportStatus, MetricFilters, MetricSeriesPoint,
-    MetricSummary, ModelEffortStat, ModelStat, Overview, PricingCatalogStatus, PricingModel,
-    PricingRate, PricingRateInput, SourceInfo, TaskRow, TimeseriesPoint,
+    AnalyticsFilters, DashboardData, DataIntegrityStatus, ImportStatus, MetricFilters,
+    MetricSeriesPoint, MetricSummary, ModelEffortStat, ModelStat, Overview, PricingCatalogStatus,
+    PricingModel, PricingRate, PricingRateInput, SourceInfo, TaskRow, TimeseriesPoint,
 };
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use settings::{AppSettings, SettingsState};
@@ -18,7 +18,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
 #[tauri::command]
 fn discover_sources(state: State<'_, BackendState>) -> Result<Vec<SourceInfo>, String> {
@@ -106,6 +106,14 @@ fn query_model_effort_stats(
     filters: Option<AnalyticsFilters>,
 ) -> Result<Vec<ModelEffortStat>, String> {
     analytics::query_model_effort_stats(&state.db_path, filters.unwrap_or_default())
+}
+
+#[tauri::command]
+fn query_dashboard(
+    state: State<'_, BackendState>,
+    filters: Option<AnalyticsFilters>,
+) -> Result<DashboardData, String> {
+    analytics::query_dashboard(&state.db_path, filters.unwrap_or_default(), state.status())
 }
 
 #[tauri::command]
@@ -218,6 +226,22 @@ fn show_main_window(app: &AppHandle) {
 }
 
 fn show_settings(app: &AppHandle) {
+    if app.get_webview_window("settings").is_none() {
+        let _ = WebviewWindowBuilder::new(
+            app,
+            "settings",
+            WebviewUrl::App("index.html?view=settings".into()),
+        )
+        .title("Agent Meter 设置")
+        .inner_size(560.0, 760.0)
+        .min_inner_size(480.0, 620.0)
+        .center()
+        .visible(false)
+        .transparent(true)
+        .decorations(true)
+        .resizable(true)
+        .build();
+    }
     show_window(app, "settings");
 }
 
@@ -272,10 +296,21 @@ fn app_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
 }
 
 fn tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+    let dashboard = MenuItem::with_id(app, "dashboard", "打开看板", true, None::<&str>)?;
     let refresh = MenuItem::with_id(app, "refresh", "刷新", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "设置", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出 Agent Meter", true, None::<&str>)?;
-    Menu::with_items(app, &[&refresh, &settings, &quit])
+    Menu::with_items(
+        app,
+        &[
+            &dashboard,
+            &PredefinedMenuItem::separator(app)?,
+            &refresh,
+            &settings,
+            &PredefinedMenuItem::separator(app)?,
+            &quit,
+        ],
+    )
 }
 
 fn build_metric_tray(app: &AppHandle, id: &str, title: &str, tooltip: &str) -> tauri::Result<()> {
@@ -382,6 +417,7 @@ fn setup_trays(app: &tauri::App, settings: &AppSettings) -> tauri::Result<()> {
         }
     });
     app.on_menu_event(|app, event| match event.id().as_ref() {
+        "dashboard" => show_main_window(app),
         "refresh" => {
             let state = app.state::<BackendState>();
             importer::start_background_import(app.clone(), state.inner().clone());
@@ -437,7 +473,7 @@ fn update_tray_titles(app: &AppHandle, state: &BackendState) {
                 .map(|value| {
                     if value >= 10_000.0 {
                         format!("{:.0}s", value / 1000.0)
-                    } else if value >= 1000.0 {
+                    } else if value >= 500.0 {
                         format!("{:.1}s", value / 1000.0)
                     } else {
                         format!("{value:.0}ms")
@@ -471,19 +507,19 @@ fn update_tray_titles(app: &AppHandle, state: &BackendState) {
         .map(|reason| format!("{source_name} · {reason}"))
         .unwrap_or_else(|| format!("{source_name} · {period}"));
     if let Some(tray) = app.tray_by_id("metric-tokens") {
-        let _ = tray.set_icon_with_as_template(Some(metric_icon::render("量", &token)), true);
+        let _ = tray.set_icon_with_as_template(Some(metric_icon::render("TOK", &token)), true);
         let _ = tray.set_tooltip(Some(format!("{tooltip_prefix} · Token 总量 {token}")));
     }
     if let Some(tray) = app.tray_by_id("metric-ttft") {
-        let _ = tray.set_icon_with_as_template(Some(metric_icon::render("首", &ttft)), true);
+        let _ = tray.set_icon_with_as_template(Some(metric_icon::render("TTFT", &ttft)), true);
         let _ = tray.set_tooltip(Some(format!("{tooltip_prefix} · 平均首响 {ttft}")));
     }
     if let Some(tray) = app.tray_by_id("metric-tps") {
-        let _ = tray.set_icon_with_as_template(Some(metric_icon::render("速", &tps)), true);
+        let _ = tray.set_icon_with_as_template(Some(metric_icon::render("TPS", &tps)), true);
         let _ = tray.set_tooltip(Some(format!("{tooltip_prefix} · 平均有效 TPS {tps}")));
     }
     if let Some(tray) = app.tray_by_id("metric-cost") {
-        let _ = tray.set_icon_with_as_template(Some(metric_icon::render("费", &cost)), true);
+        let _ = tray.set_icon_with_as_template(Some(metric_icon::render("USD", &cost)), true);
         let tooltip = unavailable_reason.map_or_else(
             || {
                 format!(
@@ -539,6 +575,17 @@ fn compact_number(value: i64) -> String {
     }
 }
 
+const FILE_EVENT_DEBOUNCE: Duration = Duration::from_millis(750);
+const FALLBACK_SYNC_INTERVAL: Duration = Duration::from_secs(300);
+
+fn background_wait_timeout(has_pending_event: bool) -> Duration {
+    if has_pending_event {
+        FILE_EVENT_DEBOUNCE
+    } else {
+        FALLBACK_SYNC_INTERVAL
+    }
+}
+
 fn begin_background_loop(app: AppHandle, state: BackendState) {
     std::thread::spawn(move || {
         let (tx, rx) = mpsc::channel();
@@ -558,22 +605,39 @@ fn begin_background_loop(app: AppHandle, state: BackendState) {
                 }
             }
         }
+        let watcher_available = watcher.is_some();
 
         update_tray_titles(&app, &state);
         importer::start_background_import(app.clone(), state.clone());
 
+        let mut pending_event = false;
         loop {
-            let should_scan = match rx.recv_timeout(Duration::from_secs(5)) {
-                Ok(Ok(event)) => event.paths.iter().any(|path| db::is_rollout(path)),
+            if !watcher_available {
+                std::thread::sleep(FALLBACK_SYNC_INTERVAL);
+                update_tray_titles(&app, &state);
+                importer::start_background_import(app.clone(), state.clone());
+                continue;
+            }
+            let should_scan = match rx.recv_timeout(background_wait_timeout(pending_event)) {
+                Ok(Ok(event)) => {
+                    pending_event |= event.paths.iter().any(|path| db::is_rollout(path));
+                    false
+                }
                 Ok(Err(error)) => {
                     use tauri::Emitter;
                     let _ = app.emit("source-error", format!("文件监听错误: {error}"));
+                    pending_event = true;
+                    false
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    pending_event = false;
                     true
                 }
-                Err(RecvTimeoutError::Timeout) => true,
-                Err(RecvTimeoutError::Disconnected) => true,
+                Err(RecvTimeoutError::Disconnected) => {
+                    std::thread::sleep(FALLBACK_SYNC_INTERVAL);
+                    true
+                }
             };
-            while rx.try_recv().is_ok() {}
             if should_scan {
                 update_tray_titles(&app, &state);
                 importer::start_background_import(app.clone(), state.clone());
@@ -651,6 +715,7 @@ pub fn run() {
             query_metric_summary,
             query_metric_series,
             query_model_effort_stats,
+            query_dashboard,
             get_pricing_catalog_status,
             reprice_usage,
             get_data_integrity_status,
@@ -738,5 +803,11 @@ mod tests {
         assert_eq!(paths.len(), 2);
         assert!(paths.contains(&root.join("sessions")));
         assert!(paths.contains(&root.join("archived_sessions")));
+    }
+
+    #[test]
+    fn background_sync_waits_for_event_debounce_or_five_minute_fallback() {
+        assert_eq!(background_wait_timeout(false), Duration::from_secs(300));
+        assert_eq!(background_wait_timeout(true), Duration::from_millis(750));
     }
 }

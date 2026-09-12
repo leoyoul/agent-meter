@@ -1,6 +1,6 @@
 [package]
 name = "agent-meter"
-version = "0.4.2"
+version = "0.4.3"
 description = "Local Agent usage, performance, and API-equivalent cost monitor"
 authors = ["LeoY"]
 edition = "2021"

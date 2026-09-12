@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { Activity, BarChart3, Check, ChevronDown, CircleAlert, CloudDownload, Coins, Database, Gauge, Info, LoaderCircle, Pause, Pencil, Play, Plus, RefreshCw, Search, Settings, Timer, Trash2, X, Zap } from 'lucide-vue-next'
+import { BarChart3, Check, ChevronDown, CircleAlert, CloudDownload, Coins, Database, Gauge, Info, LoaderCircle, Pause, Pencil, Play, Plus, RefreshCw, Search, Settings, Timer, Trash2, X, Zap } from 'lucide-vue-next'
 import { meterApi } from './api'
 import type { AnalyticsFilters, AppSettings, AppUpdateState, DataIntegrityStatus, ImportStatus, MetricPeriod, MetricSeriesPoint, MetricSummary, ModelEffortStat, PricingCatalogStatus, PricingModel, PricingRate, PricingRateInput, SourceInfo } from './shared'
+import brandLogo from './assets/agent-meter-logo.svg'
 
 const periods: Array<[MetricPeriod, string]> = [['realtime', '实时'], ['today', '今日'], ['week', '本周'], ['month', '本月'], ['year', '本年']]
 const isSettingsView = new URLSearchParams(window.location.search).get('view') === 'settings'
@@ -29,6 +30,10 @@ const updateState = ref<AppUpdateState>({ phase: 'idle', currentVersion: '0.4.2'
 const unlisteners: Array<() => void> = []
 let updateDelay: ReturnType<typeof setTimeout> | undefined
 let updateInterval: ReturnType<typeof setInterval> | undefined
+let metricsRefreshDelay: ReturnType<typeof setTimeout> | undefined
+let dashboardLoading = false
+let dashboardReloadRequested = false
+let disposed = false
 
 const modelNames = computed(() => [...new Set(stats.value.map(row => row.model))].sort())
 const efforts = computed(() => [...new Set(stats.value.map(row => row.reasoningEffort))].sort())
@@ -46,6 +51,14 @@ const filteredPricingModels = computed(() => { const query = priceSearch.value.t
 const formatCompact = (value: number) => new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 1 }).format(value)
 const formatDuration = (value: number | null | undefined) => value == null ? '—' : value < 1000 ? `${Math.round(value)} ms` : `${(value / 1000).toFixed(1)} s`
 const formatTps = (value: number | null | undefined) => value == null ? '—' : value.toFixed(1)
+const pricingReason = (model: PricingModel) => {
+  const key = model.model.toLowerCase()
+  if (model.pricingStatus === 'partial') return '缓存桶缺少可核验单价，已计入其余 Token'
+  if (key === 'unknown') return '原始记录未提供模型标识，无法安全匹配单价'
+  if (key.includes('image') || key.includes('vision')) return '图像或视觉模型通常按图片计费，不适用纯 Token 单价'
+  if (key === 'big-pickle') return '未找到可核验的公开文本 API 单价'
+  return '尚未收录可核验的官方文本 API 单价'
+}
 const formatCost = (nano: number, complete = true) => `${new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: nano >= 10_000_000_000 ? 0 : 2, maximumFractionDigits: nano >= 1_000_000_000 ? 2 : 4 }).format(nano / 1_000_000_000)}${complete ? '' : '+'}`
 const formatTime = (value: string | null | undefined) => value ? new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(new Date(value)) : '—'
 const formatBytes = (value: number) => value >= 1_073_741_824 ? `${(value / 1_073_741_824).toFixed(1)} GB` : `${Math.max(0, value / 1_048_576).toFixed(value < 10_485_760 ? 1 : 0)} MB`
@@ -54,15 +67,23 @@ const cloneSettings = (value: AppSettings): AppSettings => ({ menuMetrics: { ...
 
 async function loadAll(silent = false) {
   if (isSettingsView) return
+  if (dashboardLoading) { dashboardReloadRequested = true; return }
+  dashboardLoading = true
   if (!silent) loading.value = true
   error.value = ''
   try {
     const next = { ...filters.value }
-    const [nextSummary, nextSeries, nextStats, nextStatus, nextIntegrity] = await Promise.all([meterApi.queryMetricSummary(next), meterApi.queryMetricSeries(next), meterApi.queryModelEffortStats(next), meterApi.getImportStatus(), meterApi.getDataIntegrityStatus()])
-    summary.value = nextSummary; series.value = nextSeries; stats.value = nextStats; importStatus.value = nextStatus; integrity.value = nextIntegrity
-  } catch (reason) { error.value = reason instanceof Error ? reason.message : String(reason) }
-  finally { loading.value = false }
+    const dashboard = await meterApi.queryDashboard(next)
+    if (disposed) return
+    summary.value = dashboard.summary; series.value = dashboard.series; stats.value = dashboard.stats; importStatus.value = dashboard.importStatus; integrity.value = dashboard.integrity
+  } catch (reason) { if (!disposed) error.value = reason instanceof Error ? reason.message : String(reason) }
+  finally {
+    dashboardLoading = false
+    loading.value = false
+    if (!disposed && dashboardReloadRequested) { dashboardReloadRequested = false; void loadAll(true) }
+  }
 }
+function scheduleMetricsRefresh() { if (metricsRefreshDelay) clearTimeout(metricsRefreshDelay); metricsRefreshDelay = setTimeout(() => { metricsRefreshDelay = undefined; void loadAll(true) }, 400) }
 async function saveSettings(next: AppSettings, message?: string) { try { appSettings.value = await meterApi.updateAppSettings(next); if (message) lastAction.value = message } catch (reason) { error.value = String(reason) } }
 async function selectPeriod(period: MetricPeriod) { filters.value.period = period; const next = cloneSettings(appSettings.value); next.menuPeriod = period; await saveSettings(next) }
 async function selectSource(source: SourceInfo | null) { const next = cloneSettings(appSettings.value); next.activeSourceKind = source?.sourceKind ?? null; filters.value.sourceId = source?.id; filters.value.model = undefined; filters.value.reasoningEffort = undefined; await saveSettings(next) }
@@ -84,24 +105,25 @@ async function downloadAndRestart() { try { await meterApi.downloadAndInstallUpd
 
 watch(filters, () => loadAll(), { deep: true })
 onMounted(async () => {
+  disposed = false
   document.body.dataset.view = isSettingsView ? 'settings' : 'dashboard'
-  const [nextSources, nextAutostart, nextSettings, nextPricing, nextPricingModels, currentVersion, nextStatus] = await Promise.all([meterApi.discoverSources(), meterApi.isAutostartEnabled(), meterApi.getAppSettings(), meterApi.getPricingCatalogStatus(), meterApi.listPricingModels(), meterApi.getCurrentVersion(), meterApi.getImportStatus()])
-  sources.value = nextSources; autostartEnabled.value = nextAutostart; appSettings.value = nextSettings; pricing.value = nextPricing; pricingModels.value = nextPricingModels; importStatus.value = nextStatus; filters.value.period = nextSettings.menuPeriod; filters.value.sourceId = nextSources.find(item => item.sourceKind === nextSettings.activeSourceKind)?.id; updateState.value.currentVersion = currentVersion
+  const [nextSources, nextAutostart, nextSettings, nextPricing, nextPricingModels, currentVersion] = await Promise.all([meterApi.discoverSources(), meterApi.isAutostartEnabled(), meterApi.getAppSettings(), meterApi.getPricingCatalogStatus(), meterApi.listPricingModels(), meterApi.getCurrentVersion()])
+  sources.value = nextSources; autostartEnabled.value = nextAutostart; appSettings.value = nextSettings; pricing.value = nextPricing; pricingModels.value = nextPricingModels; filters.value.period = nextSettings.menuPeriod; filters.value.sourceId = nextSources.find(item => item.sourceKind === nextSettings.activeSourceKind)?.id; updateState.value.currentVersion = currentVersion
   await loadAll()
   unlisteners.push(await meterApi.on<ImportStatus>('import-progress', payload => { importStatus.value = payload }))
-  unlisteners.push(await meterApi.on('metrics-updated', () => loadAll(true)))
+  unlisteners.push(await meterApi.on('metrics-updated', scheduleMetricsRefresh))
   unlisteners.push(await meterApi.on<string>('source-error', payload => { error.value = payload }))
   unlisteners.push(await meterApi.on<AppSettings>('settings-updated', payload => { appSettings.value = payload; filters.value.period = payload.menuPeriod; filters.value.sourceId = sources.value.find(item => item.sourceKind === payload.activeSourceKind)?.id }))
   unlisteners.push(await meterApi.on('sources-updated', async () => { sources.value = await meterApi.discoverSources() }))
   if (!isSettingsView && meterApi.isTauri()) { updateDelay = setTimeout(() => { if (appSettings.value.updates.automaticCheck) void checkForUpdates(true) }, 15_000); updateInterval = setInterval(() => { if (appSettings.value.updates.automaticCheck) void checkForUpdates(true) }, 86_400_000) }
 })
-onBeforeUnmount(() => { unlisteners.splice(0).forEach(fn => fn()); if (updateDelay) clearTimeout(updateDelay); if (updateInterval) clearInterval(updateInterval) })
+onBeforeUnmount(() => { disposed = true; dashboardReloadRequested = false; unlisteners.splice(0).forEach(fn => fn()); if (updateDelay) clearTimeout(updateDelay); if (updateInterval) clearInterval(updateInterval); if (metricsRefreshDelay) clearTimeout(metricsRefreshDelay) })
 </script>
 
 <template>
   <main v-if="!isSettingsView" class="app-shell">
     <header class="topbar">
-      <div class="brand"><div class="brand-mark"><Activity :size="20" /></div><div><strong>Agent Meter</strong><span>本机 Agent 四指标</span></div></div>
+      <div class="brand"><div class="brand-mark"><img :src="brandLogo" alt="" /></div><div><strong>Agent Meter</strong><span>本机 Agent 四指标</span></div></div>
       <div class="header-actions"><span class="freshness"><i :class="{ live: importStatus?.running }"></i>{{ importStatus?.running ? '正在同步' : `更新于 ${formatTime(summary?.lastUpdatedAt)}` }}</span><button class="icon-button" title="刷新数据" aria-label="刷新数据" @click="runImport(false)"><RefreshCw :size="18" :class="{ spin: importStatus?.running }" /></button><button class="icon-button" title="设置" aria-label="打开设置窗口" @click="meterApi.showSettingsWindow()"><Settings :size="18" /></button></div>
     </header>
 
@@ -142,17 +164,17 @@ onBeforeUnmount(() => { unlisteners.splice(0).forEach(fn => fn()); if (updateDel
     <section v-if="!sourceUnavailable" class="panel integrity-panel"><div class="panel-heading"><div><span class="eyebrow">统计可信度</span><h2>{{ integrity?.reconciled ? '已对账' : '存在统计缺口' }}</h2></div><span class="integrity-state" :class="{ warning: !integrity?.reconciled }">{{ integrity?.reconciled ? '原始层与统计层一致' : '数据尚未完全同步' }}</span></div><div class="table-scroll"><table><thead><tr><th>来源</th><th>原始调用</th><th>已索引</th><th>差异</th><th>未读</th><th>解析错误</th><th>最后调用</th><th>同步延迟</th></tr></thead><tbody><tr v-for="item in integrity?.sources" :key="item.sourceId"><td><strong>{{ item.sourceName }}</strong></td><td>{{ item.rawCallCount }}</td><td>{{ item.indexedCallCount }}</td><td :class="{ 'danger-text': item.difference }">{{ item.difference }}</td><td>{{ formatBytes(item.unreadBytes) }}</td><td :class="{ 'danger-text': item.parseErrorCount }">{{ item.parseErrorCount }}</td><td>{{ formatTime(item.lastCallAt) }}</td><td>{{ formatDuration(item.syncDelayMs) }}</td></tr></tbody></table></div></section>
     </template>
 
-    <section v-else class="pricing-page"><div class="pricing-toolbar"><label class="search-box"><Search :size="16"/><input v-model="priceSearch" placeholder="搜索模型或 Vendor" /></label><button class="primary-button" @click="openPriceEditor()"><Plus :size="16"/>新增价格</button></div><div class="panel pricing-table"><div class="panel-heading"><div><span class="eyebrow">价格管理</span><h2>模型与生效版本</h2></div><span class="coverage">{{ pricingModels.length }} 个模型</span></div><div class="table-scroll"><table><thead><tr><th>模型 / Vendor</th><th>调用</th><th>输入</th><th>缓存读</th><th>缓存写</th><th>输出</th><th>生效区间</th><th>操作</th></tr></thead><tbody><template v-for="model in filteredPricingModels" :key="model.model"><tr v-if="!model.rates.length"><td><strong>{{ model.model }}</strong><small>{{ model.vendor }}</small></td><td>{{ model.callCount }}</td><td colspan="5"><span class="unpriced">未计价</span></td><td><button class="icon-button compact" title="为此模型创建价格" @click="openPriceEditor(undefined, model)"><Plus :size="15"/></button></td></tr><tr v-for="rate in model.rates" :key="rate.id"><td><strong>{{ rate.model }}</strong><small>{{ rate.vendor }} · {{ rate.aliases.join(', ') || '无别名' }}</small></td><td>{{ model.callCount }}</td><td>${{ rate.inputUsdPerMillion }}</td><td>{{ rate.cachedReadUsdPerMillion == null ? '空白' : `$${rate.cachedReadUsdPerMillion}` }}</td><td>{{ rate.cachedWriteUsdPerMillion == null ? '空白' : `$${rate.cachedWriteUsdPerMillion}` }}</td><td>${{ rate.outputUsdPerMillion }}</td><td>{{ rate.effectiveFrom }}<small>至 {{ rate.effectiveTo || '长期' }}</small></td><td><div class="row-actions"><button class="icon-button compact" title="编辑价格" @click="openPriceEditor(rate)"><Pencil :size="14"/></button><button class="icon-button compact danger-text" title="删除价格版本" @click="deletePrice(rate)"><Trash2 :size="14"/></button></div></td></tr></template></tbody></table></div></div></section>
+    <section v-else class="pricing-page"><div class="pricing-toolbar"><label class="search-box"><Search :size="16"/><input v-model="priceSearch" placeholder="搜索模型或 Vendor" /></label><button class="primary-button" @click="openPriceEditor()"><Plus :size="16"/>新增价格</button></div><div class="panel pricing-table"><div class="panel-heading"><div><span class="eyebrow">价格管理</span><h2>模型与生效版本</h2></div><span class="coverage">{{ pricingModels.length }} 个模型</span></div><div class="table-scroll"><table><thead><tr><th>模型 / Vendor</th><th>调用</th><th>输入</th><th>缓存读</th><th>缓存写</th><th>输出</th><th>生效区间</th><th>操作</th></tr></thead><tbody><template v-for="model in filteredPricingModels" :key="model.model"><tr v-if="!model.rates.length"><td><strong>{{ model.model }}</strong><small>{{ model.vendor }}</small></td><td>{{ model.callCount }}</td><td colspan="5"><span class="unpriced">未计价</span><small class="pricing-reason">{{ pricingReason(model) }}</small></td><td><button class="icon-button compact" title="为此模型创建价格" @click="openPriceEditor(undefined, model)"><Plus :size="15"/></button></td></tr><tr v-for="rate in model.rates" :key="rate.id"><td><strong>{{ rate.model }}</strong><small>{{ rate.vendor }} · {{ rate.aliases.join(', ') || '无别名' }}</small></td><td>{{ model.callCount }}</td><td>${{ rate.inputUsdPerMillion }}</td><td>{{ rate.cachedReadUsdPerMillion == null ? '空白' : `$${rate.cachedReadUsdPerMillion}` }}</td><td>{{ rate.cachedWriteUsdPerMillion == null ? '空白' : `$${rate.cachedWriteUsdPerMillion}` }}</td><td>${{ rate.outputUsdPerMillion }}</td><td>{{ rate.effectiveFrom }}<small>至 {{ rate.effectiveTo || '长期' }}</small></td><td><div class="row-actions"><button class="icon-button compact" title="编辑价格" @click="openPriceEditor(rate)"><Pencil :size="14"/></button><button class="icon-button compact danger-text" title="删除价格版本" @click="deletePrice(rate)"><Trash2 :size="14"/></button></div></td></tr></template></tbody></table></div></div></section>
 
     <div v-if="pricingEditor" class="modal-backdrop" @click.self="pricingEditor = false"><form class="price-editor" @submit.prevent="savePrice"><div class="panel-heading"><div><span class="eyebrow">价格版本</span><h2>{{ editingRateId == null ? '新增价格' : '编辑价格' }}</h2></div><button type="button" class="icon-button compact" aria-label="关闭价格编辑" @click="pricingEditor = false"><X :size="16"/></button></div><div class="form-grid"><label><span>Vendor</span><input v-model="priceForm.vendor" required /></label><label><span>模型</span><input v-model="priceForm.model" required /></label><label class="wide"><span>别名（逗号分隔）</span><input :value="priceForm.aliases.join(', ')" @input="priceForm.aliases = ($event.target as HTMLInputElement).value.split(',').map(v => v.trim()).filter(Boolean)" /></label><label><span>输入 $/百万</span><input v-model="priceForm.inputUsdPerMillion" inputmode="decimal" required /></label><label><span>缓存读取 $/百万</span><input v-model="priceForm.cachedReadUsdPerMillion" inputmode="decimal" placeholder="空白表示未计价" /></label><label><span>缓存写入 $/百万</span><input v-model="priceForm.cachedWriteUsdPerMillion" inputmode="decimal" placeholder="空白表示未计价" /></label><label><span>输出 $/百万</span><input v-model="priceForm.outputUsdPerMillion" inputmode="decimal" required /></label><label><span>生效日期</span><input v-model="priceForm.effectiveFrom" type="date" required /></label><label><span>结束日期</span><input v-model="priceForm.effectiveTo" type="date" /></label><label class="wide"><span>来源链接</span><input v-model="priceForm.sourceUrl" type="url" /></label></div><p class="form-hint">缓存价格空白表示该桶未计价；填写 0 表示免费。</p><div class="editor-actions"><button type="button" class="secondary-button" @click="pricingEditor = false">取消</button><button class="primary-button" type="submit"><Check :size="15"/>保存并重算</button></div></form></div>
 
   </main>
 
-  <main v-else class="settings-page" aria-label="Agent Meter 设置"><header class="settings-header"><div class="brand"><div class="brand-mark"><Settings :size="20" /></div><div><strong>Agent Meter 设置</strong><span>菜单栏、数据源与应用更新</span></div></div><small>v{{ updateState.currentVersion }}</small></header>
+  <main v-else class="settings-page" aria-label="Agent Meter 设置"><header class="settings-header"><div class="brand"><div class="brand-mark"><img :src="brandLogo" alt="" /></div><div><strong>Agent Meter 设置</strong><span>菜单栏、数据源与应用更新</span></div></div><small>v{{ updateState.currentVersion }}</small></header>
     <div v-if="error" class="notice error"><CircleAlert :size="18" />{{ error }}<button aria-label="关闭错误" @click="error = ''"><X :size="16" /></button></div>
     <div v-if="lastAction" class="notice success"><Check :size="18" />{{ lastAction }}<button aria-label="关闭提示" @click="lastAction = ''"><X :size="16" /></button></div>
       <section><h3>菜单栏四指标</h3><p class="settings-note">每项固定为 30×22pt，大数值在上、指标名在下；应用图标默认隐藏。四项共用下方周期。</p><div class="menu-period segmented"><button v-for="[key, label] in periods" :key="key" :class="{ active: appSettings.menuPeriod === key }" @click="selectPeriod(key)">{{ label }}</button></div>
-        <div v-for="item in ([['effectiveTps','速','平均有效 TPS',Zap],['ttft','首','平均首响时间',Timer],['todayTokens','量','Token 累加总量',Gauge],['estimatedCost','费','API 等价费用',Coins]] as const)" :key="item[0]" class="source-row"><div class="metric-mini">{{ item[1] }}</div><div><strong>{{ item[1] }} · {{ item[2] }}</strong><small>独立固定宽度状态项</small></div><button class="switch" :class="{ on: appSettings.menuMetrics[item[0]] }" role="switch" :aria-checked="appSettings.menuMetrics[item[0]]" :aria-label="`切换${item[1]}菜单栏指标`" @click="toggleMenuMetric(item[0])"><i></i></button></div>
+        <div v-for="item in ([['effectiveTps','TPS','平均有效 TPS',Zap],['ttft','TTFT','平均首响时间',Timer],['todayTokens','TOK','Token 累加总量',Gauge],['estimatedCost','USD','API 等价费用',Coins]] as const)" :key="item[0]" class="source-row"><div class="metric-mini">{{ item[1] }}</div><div><strong>{{ item[1] }} · {{ item[2] }}</strong><small>独立固定宽度状态项</small></div><button class="switch" :class="{ on: appSettings.menuMetrics[item[0]] }" role="switch" :aria-checked="appSettings.menuMetrics[item[0]]" :aria-label="`切换${item[1]}菜单栏指标`" @click="toggleMenuMetric(item[0])"><i></i></button></div>
         <div class="source-row"><div class="metric-mini">标</div><div><strong>应用图标</strong><small>关闭后由指标项承载菜单入口</small></div><button class="switch" :class="{ on: appSettings.showAppIcon }" role="switch" :aria-checked="appSettings.showAppIcon" aria-label="切换应用图标显示" @click="toggleAppIcon"><i></i></button></div>
       </section>
       <section><h3>本机只读数据源</h3><div v-for="source in sources" :key="source.id" class="source-row"><div class="source-icon"><Database :size="19" /></div><div><strong>{{ source.name }}</strong><small>{{ source.rootPath }} · {{ source.fileCount }} 个数据文件 · {{ formatBytes(source.totalBytes) }}</small><em v-if="source.limitation || source.error">{{ source.limitation || source.error }}</em></div><button class="switch" :class="{ on: source.enabled }" role="switch" :aria-checked="source.enabled" :aria-label="`${source.enabled ? '停用' : '启用'} ${source.name}`" @click="toggleSource(source)"><i></i></button></div></section>

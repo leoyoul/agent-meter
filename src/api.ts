@@ -4,7 +4,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { disable, enable, isEnabled } from '@tauri-apps/plugin-autostart'
 import { relaunch } from '@tauri-apps/plugin-process'
 import { check, type Update } from '@tauri-apps/plugin-updater'
-import type { AnalyticsFilters, AppSettings, AppUpdateState, DataIntegrityStatus, ImportStatus, MetricSeriesPoint, MetricSummary, ModelEffortStat, PricingCatalogStatus, PricingModel, PricingRate, PricingRateInput, SourceInfo } from './shared'
+import type { AnalyticsFilters, AppSettings, AppUpdateState, DashboardData, DataIntegrityStatus, ImportStatus, MetricSeriesPoint, MetricSummary, ModelEffortStat, PricingCatalogStatus, PricingModel, PricingRate, PricingRateInput, SourceInfo } from './shared'
 
 export type MeterEvent = 'import-progress' | 'metrics-updated' | 'source-error' | 'settings-updated' | 'sources-updated'
 const isTauri = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
@@ -57,6 +57,7 @@ export const meterApi = {
   startImport: (force = false) => call<ImportStatus>('start_import', { force }, () => (mockStatus = { ...mockStatus, running: true, paused: false, message: force ? '正在重建索引' : '正在同步本机指标' })),
   pauseImport: () => call<ImportStatus>('pause_import', undefined, () => (mockStatus = { ...mockStatus, running: false, paused: true, message: '导入已暂停' })),
   getImportStatus: () => call<ImportStatus>('get_import_status', undefined, () => ({ ...mockStatus })),
+  queryDashboard: (filters: AnalyticsFilters) => call<DashboardData>('query_dashboard', { filters }, () => ({ summary: { ...summarize(filtered(filters)), period: filters.period }, series: structuredClone(series), stats: structuredClone(filtered(filters)), importStatus: { ...mockStatus }, integrity: structuredClone(integrity) })),
   queryMetricSummary: (filters: AnalyticsFilters) => call<MetricSummary>('query_metric_summary', { filters }, () => ({ ...summarize(filtered(filters)), period: filters.period })),
   queryMetricSeries: (filters: AnalyticsFilters) => call<MetricSeriesPoint[]>('query_metric_series', { filters }, () => structuredClone(series)),
   queryModelEffortStats: (filters: AnalyticsFilters) => call<ModelEffortStat[]>('query_model_effort_stats', { filters }, () => structuredClone(filtered(filters))),

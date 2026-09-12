@@ -1,6 +1,6 @@
 {
   "name": "agent-meter",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "private": true,
   "description": "Local-first macOS menu bar metrics for Codex, ZCode, OpenCode, DSH, Claude Desktop, and EvoX.",
   "author": "LeoY",

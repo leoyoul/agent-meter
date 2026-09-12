@@ -25,3 +25,4 @@ export interface PricingModel { vendor: string; model: string; callCount: number
 export interface PricingCatalogStatus { version: string; currency: string; verifiedAt: string; rates: PricingRate[]; pricedObservations: number; totalObservations: number }
 export interface SourceIntegrityStatus { sourceId: number; sourceName: string; rawCallCount: number; indexedCallCount: number; difference: number; unreadBytes: number; parseErrorCount: number; lastCallAt: string | null; syncDelayMs: number | null; reconciled: boolean; error: string | null }
 export interface DataIntegrityStatus { reconciled: boolean; sources: SourceIntegrityStatus[] }
+export interface DashboardData { summary: MetricSummary; series: MetricSeriesPoint[]; stats: ModelEffortStat[]; importStatus: ImportStatus; integrity: DataIntegrityStatus }

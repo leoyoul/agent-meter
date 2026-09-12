@@ -1,8 +1,8 @@
 use crate::db::{self, AppResult};
 use crate::models::{
-    AnalyticsFilters, DataIntegrityStatus, MetricPeriod, MetricSeriesPoint, MetricSummary,
-    ModelEffortStat, PricingCatalogStatus, PricingCoverage, PricingModel, PricingRate,
-    PricingRateInput, SourceIntegrityStatus, UsageTokens,
+    AnalyticsFilters, DashboardData, DataIntegrityStatus, ImportStatus, MetricPeriod,
+    MetricSeriesPoint, MetricSummary, ModelEffortStat, PricingCatalogStatus, PricingCoverage,
+    PricingModel, PricingRate, PricingRateInput, SourceIntegrityStatus, UsageTokens,
 };
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, TimeZone, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
@@ -14,8 +14,8 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use walkdir::WalkDir;
 
-const CATALOG_VERSION: &str = "2026-09-06.2";
-const VERIFIED_AT: &str = "2026-09-06";
+const CATALOG_VERSION: &str = "2026-09-07.3";
+const VERIFIED_AT: &str = "2026-09-07";
 
 #[derive(Clone, Copy)]
 struct RateDef {
@@ -205,6 +205,66 @@ const RATES: &[RateDef] = &[
         effective_from: "2026-01-01",
         effective_to: None,
         source_url: "https://api-docs.deepseek.com/quick_start/pricing",
+    },
+    RateDef {
+        vendor: "Meta",
+        model: "muse-spark-1.2",
+        aliases: &["muse-spark-1.2-contributor"],
+        input: 100_000,
+        cached_read: None,
+        cached_write: None,
+        output: 200_000,
+        effective_from: "2026-04-22",
+        effective_to: None,
+        source_url: "https://vercel.com/ai-gateway/models/muse-spark-1.2-contributor/about",
+    },
+    RateDef {
+        vendor: "Xiaomi",
+        model: "mimo-v2.5",
+        aliases: &[],
+        input: 120_000,
+        cached_read: None,
+        cached_write: None,
+        output: 240_000,
+        effective_from: "2026-04-22",
+        effective_to: None,
+        source_url: "https://vercel.com/ai-gateway/models/mimo-v2.5/about",
+    },
+    RateDef {
+        vendor: "Xiaomi",
+        model: "mimo-v2.5-pro",
+        aliases: &[],
+        input: 300_000,
+        cached_read: None,
+        cached_write: None,
+        output: 610_000,
+        effective_from: "2026-04-22",
+        effective_to: None,
+        source_url: "https://vercel.com/ai-gateway/models/mimo-v2.5-pro/about",
+    },
+    RateDef {
+        vendor: "Tencent Cloud",
+        model: "hy3",
+        aliases: &[],
+        input: 126_000,
+        cached_read: Some(31_500),
+        cached_write: None,
+        output: 522_000,
+        effective_from: "2026-07-06",
+        effective_to: None,
+        source_url: "https://vercel.com/ai-gateway/models/hy3/about",
+    },
+    RateDef {
+        vendor: "Z.AI",
+        model: "glm-5.3-flash",
+        aliases: &[],
+        input: 70_000,
+        cached_read: Some(10_000),
+        cached_write: None,
+        output: 240_000,
+        effective_from: "2026-08-26",
+        effective_to: None,
+        source_url: "https://vercel.com/ai-gateway/models/glm-5.3-flash",
     },
     RateDef {
         vendor: "Meta",
@@ -1435,6 +1495,12 @@ fn is_local(provider: &str, model: &str) -> bool {
             .any(|prefix| m.starts_with(prefix))
 }
 
+fn is_explicitly_free(model: &str) -> bool {
+    ["mimo-v2.5-free", "hy3-free", "nemotron-3.5-lightning-free"]
+        .iter()
+        .any(|name| model.eq_ignore_ascii_case(name))
+}
+
 #[cfg(test)]
 fn rate_for(model: &str, date: &str) -> Option<&'static RateDef> {
     RATES
@@ -1576,26 +1642,27 @@ fn reprice_conn(conn: &Connection) -> AppResult<()> {
             .single()
             .map(|v| v.format("%Y-%m-%d").to_string())
             .unwrap_or_else(|| "1970-01-01".into());
-        let (cost, priced, status, key) = if is_local(&provider, &model) {
-            (0, total, "free", None::<i64>)
-        } else if let Some(rate) = db_rate_for(&rates, &model, &date) {
-            let mut cost_pico =
-                uncached.saturating_mul(rate.input) + output.saturating_mul(rate.output);
-            let mut priced = uncached + output;
-            if let Some(value) = rate.cached_read {
-                cost_pico = cost_pico.saturating_add(cache_read.saturating_mul(value));
-                priced += cache_read;
-            }
-            if let Some(value) = rate.cached_write {
-                cost_pico = cost_pico.saturating_add(cache_write.saturating_mul(value));
-                priced += cache_write;
-            }
-            let cost = cost_pico.saturating_add(500) / 1_000;
-            let status = if priced >= total { "priced" } else { "partial" };
-            (cost, priced, status, Some(rate.id))
-        } else {
-            (0, 0, "unpriced", None)
-        };
+        let (cost, priced, status, key) =
+            if is_local(&provider, &model) || is_explicitly_free(&model) {
+                (0, total, "free", None::<i64>)
+            } else if let Some(rate) = db_rate_for(&rates, &model, &date) {
+                let mut cost_pico =
+                    uncached.saturating_mul(rate.input) + output.saturating_mul(rate.output);
+                let mut priced = uncached + output;
+                if let Some(value) = rate.cached_read {
+                    cost_pico = cost_pico.saturating_add(cache_read.saturating_mul(value));
+                    priced += cache_read;
+                }
+                if let Some(value) = rate.cached_write {
+                    cost_pico = cost_pico.saturating_add(cache_write.saturating_mul(value));
+                    priced += cache_write;
+                }
+                let cost = cost_pico.saturating_add(500) / 1_000;
+                let status = if priced >= total { "priced" } else { "partial" };
+                (cost, priced, status, Some(rate.id))
+            } else {
+                (0, 0, "unpriced", None)
+            };
         conn.execute("UPDATE model_call_observations SET estimated_cost_nano_usd=?1,priced_tokens=?2,pricing_status=?3,pricing_rate_id=?4 WHERE source_id=?5 AND external_id=?6", params![cost,priced,status,key,source_id,id]).map_err(db::to_error)?;
     }
     Ok(())
@@ -2201,18 +2268,11 @@ fn summarize(
     }
 }
 
-pub fn query_metric_summary(path: &Path, filters: AnalyticsFilters) -> AppResult<MetricSummary> {
-    let rows = load(path, &filters)?;
-    let performance = load_performance(path, &filters)?;
-    Ok(summarize(filters.period, &rows, &performance))
-}
-
-pub fn query_model_effort_stats(
-    path: &Path,
-    filters: AnalyticsFilters,
-) -> AppResult<Vec<ModelEffortStat>> {
-    let rows = load(path, &filters)?;
-    let performance = load_performance(path, &filters)?;
+fn model_effort_stats(
+    period: MetricPeriod,
+    rows: Vec<Observation>,
+    performance: &[Observation],
+) -> Vec<ModelEffortStat> {
     let mut groups: BTreeMap<(i64, String, String, String, String), Vec<Observation>> =
         BTreeMap::new();
     for row in rows {
@@ -2241,7 +2301,7 @@ pub fn query_model_effort_stats(
                     })
                     .cloned()
                     .collect::<Vec<_>>();
-                let summary = summarize(filters.period, &rows, &perf);
+                let summary = summarize(period, &rows, &perf);
                 ModelEffortStat {
                     source_id,
                     source_name,
@@ -2260,18 +2320,18 @@ pub fn query_model_effort_stats(
         )
         .collect::<Vec<_>>();
     result.sort_by_key(|row| std::cmp::Reverse(row.tokens.total));
-    Ok(result)
+    result
 }
 
-pub fn query_metric_series(
-    path: &Path,
-    filters: AnalyticsFilters,
-) -> AppResult<Vec<MetricSeriesPoint>> {
-    let rows = load(path, &filters)?;
-    let mut groups: BTreeMap<String, (String, Vec<Observation>)> = BTreeMap::new();
-    for row in rows.into_iter().rev() {
+fn metric_series(
+    period: MetricPeriod,
+    rows: &[Observation],
+    performance: &[Observation],
+) -> Vec<MetricSeriesPoint> {
+    let mut groups: BTreeMap<String, (String, Vec<&Observation>)> = BTreeMap::new();
+    for row in rows.iter().rev() {
         let local = Local.timestamp_millis_opt(row.completed_at).single();
-        let (bucket, label) = match (filters.period, local) {
+        let (bucket, label) = match (period, local) {
             (MetricPeriod::Realtime, Some(v)) => (
                 format!("{}-{}", v.format("%H:%M:%S"), row.model),
                 v.format("%H:%M").to_string(),
@@ -2295,15 +2355,14 @@ pub fn query_metric_series(
             .1
             .push(row);
     }
-    Ok(groups
+    groups
         .into_iter()
         .map(|(bucket, (label, rows))| {
-            let performance = load_performance(path, &filters).unwrap_or_default();
             let perf = performance
                 .into_iter()
                 .filter(|row| {
                     let local = Local.timestamp_millis_opt(row.completed_at).single();
-                    match (filters.period, local) {
+                    match (period, local) {
                         (MetricPeriod::Realtime, _) => rows
                             .iter()
                             .any(|call| call.source_id == row.source_id && call.model == row.model),
@@ -2317,8 +2376,10 @@ pub fn query_metric_series(
                         _ => false,
                     }
                 })
+                .cloned()
                 .collect::<Vec<_>>();
-            let s = summarize(filters.period, &rows, &perf);
+            let bucket_rows = rows.into_iter().cloned().collect::<Vec<_>>();
+            let s = summarize(period, &bucket_rows, &perf);
             MetricSeriesPoint {
                 bucket,
                 label,
@@ -2330,7 +2391,47 @@ pub fn query_metric_series(
                 estimated_cost_nano_usd: s.estimated_cost_nano_usd,
             }
         })
-        .collect())
+        .collect()
+}
+
+pub fn query_metric_summary(path: &Path, filters: AnalyticsFilters) -> AppResult<MetricSummary> {
+    let rows = load(path, &filters)?;
+    let performance = load_performance(path, &filters)?;
+    Ok(summarize(filters.period, &rows, &performance))
+}
+
+pub fn query_model_effort_stats(
+    path: &Path,
+    filters: AnalyticsFilters,
+) -> AppResult<Vec<ModelEffortStat>> {
+    let rows = load(path, &filters)?;
+    let performance = load_performance(path, &filters)?;
+    Ok(model_effort_stats(filters.period, rows, &performance))
+}
+
+pub fn query_metric_series(
+    path: &Path,
+    filters: AnalyticsFilters,
+) -> AppResult<Vec<MetricSeriesPoint>> {
+    let rows = load(path, &filters)?;
+    let performance = load_performance(path, &filters)?;
+    Ok(metric_series(filters.period, &rows, &performance))
+}
+
+pub fn query_dashboard(
+    path: &Path,
+    filters: AnalyticsFilters,
+    import_status: ImportStatus,
+) -> AppResult<DashboardData> {
+    let rows = load(path, &filters)?;
+    let performance = load_performance(path, &filters)?;
+    Ok(DashboardData {
+        summary: summarize(filters.period, &rows, &performance),
+        series: metric_series(filters.period, &rows, &performance),
+        stats: model_effort_stats(filters.period, rows, &performance),
+        import_status,
+        integrity: get_data_integrity_status(path)?,
+    })
 }
 
 #[cfg(test)]
@@ -2407,6 +2508,17 @@ mod tests {
     }
 
     #[test]
+    fn glm_flash_rate_includes_official_cache_read_price() {
+        let rate = rate_for("glm-5.3-flash", "2026-09-07").expect("GLM Flash rate");
+        assert_eq!(rate.vendor, "Z.AI");
+        assert_eq!(rate.input, 70_000);
+        assert_eq!(rate.cached_read, Some(10_000));
+        assert_eq!(rate.cached_write, None);
+        assert_eq!(rate.output, 240_000);
+        assert!(rate_for("glm-5.3-flash", "2026-08-25").is_none());
+    }
+
+    #[test]
     fn partial_pricing_keeps_known_cost_and_reports_coverage() {
         let rows = [
             Observation {
@@ -2462,6 +2574,13 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_explicitly_free_remote_models() {
+        assert!(is_explicitly_free("mimo-v2.5-free"));
+        assert!(is_explicitly_free("HY3-FREE"));
+        assert!(!is_explicitly_free("mimo-v2.5"));
+    }
+
+    #[test]
     fn realtime_summary_uses_only_latest_ten_observations() {
         let (_temp, path) = empty_meter();
         let conn = db::open(&path).unwrap();
@@ -2507,6 +2626,61 @@ mod tests {
         assert_eq!(summary.performance_sample_count, 10);
         assert_eq!(summary.tokens.total, 200);
         assert_eq!(summary.average_effective_tps, Some(10.0));
+    }
+
+    #[test]
+    fn dashboard_query_matches_individual_metric_queries() {
+        let (_temp, path) = empty_meter();
+        let conn = db::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO sources(id,name,root_path,source_kind,enabled) VALUES (100,'Fixture','/fixture','fixture',1)",
+            [],
+        )
+        .unwrap();
+        let now = Utc::now().timestamp_millis();
+        upsert_observation(
+            &conn,
+            100,
+            "row-1",
+            "omlx",
+            "Qwen-fixture",
+            "default",
+            now,
+            Some(now),
+            Some(2_000),
+            Some(1_000),
+            "completed",
+            10,
+            0,
+            0,
+            10,
+            0,
+            &Utc::now().to_rfc3339(),
+        )
+        .unwrap();
+        materialize_observations(&conn).unwrap();
+        reprice_conn(&conn).unwrap();
+        drop(conn);
+
+        let filters = AnalyticsFilters {
+            period: MetricPeriod::Realtime,
+            ..Default::default()
+        };
+        let dashboard = query_dashboard(&path, filters.clone(), ImportStatus::default()).unwrap();
+        assert_eq!(
+            dashboard.summary.call_count,
+            query_metric_summary(&path, filters.clone())
+                .unwrap()
+                .call_count
+        );
+        assert_eq!(
+            dashboard.series.len(),
+            query_metric_series(&path, filters.clone()).unwrap().len()
+        );
+        assert_eq!(
+            dashboard.stats.len(),
+            query_model_effort_stats(&path, filters).unwrap().len()
+        );
     }
 
     fn observation(output: i64, duration_ms: i64, ttft_ms: i64) -> Observation {

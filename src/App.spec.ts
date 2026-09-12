@@ -69,7 +69,7 @@ describe('Agent Meter v0.4 windows', () => {
     const wrapper = mount(App)
     await vi.waitFor(() => expect(wrapper.text()).toContain('菜单栏、数据源与应用更新'))
     expect(wrapper.find('.app-shell').exists()).toBe(false)
-    for (const label of ['速', '首', '费']) {
+    for (const label of ['TPS', 'TTFT', 'USD']) {
       const selector = `button[aria-label="切换${label}菜单栏指标"]`
       expect(wrapper.get(selector).attributes('aria-checked')).toBe('false')
       await wrapper.get(selector).trigger('click')

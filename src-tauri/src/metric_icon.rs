@@ -1,4 +1,4 @@
-use ab_glyph::{point, Font, FontVec, ScaleFont};
+use ab_glyph::{point, Font, FontVec, PxScale, ScaleFont};
 use std::sync::OnceLock;
 use tauri::image::Image;
 
@@ -10,16 +10,27 @@ fn load_font(path: &str, collection_index: u32) -> Option<FontVec> {
     FontVec::try_from_vec_and_index(bytes, collection_index).ok()
 }
 
-fn label_font() -> Option<&'static FontVec> {
+fn pingfang_font() -> Option<&'static FontVec> {
     static FONT: OnceLock<Option<FontVec>> = OnceLock::new();
-    FONT.get_or_init(|| load_font("/System/Library/Fonts/Hiragino Sans GB.ttc", 0))
-        .as_ref()
-}
-
-fn value_font() -> Option<&'static FontVec> {
-    static FONT: OnceLock<Option<FontVec>> = OnceLock::new();
-    FONT.get_or_init(|| load_font("/System/Library/Fonts/SFNS.ttf", 0))
-        .as_ref()
+    FONT.get_or_init(|| {
+        let mut paths = vec![
+            "/System/Library/Fonts/PingFang.ttc".into(),
+            "/System/Library/Fonts/LanguageSupport/PingFang.ttc".into(),
+        ];
+        if let Ok(entries) =
+            std::fs::read_dir("/System/Library/AssetsV2/com_apple_MobileAsset_Font8")
+        {
+            paths.extend(
+                entries
+                    .flatten()
+                    .map(|entry| entry.path().join("AssetData/PingFang.ttc")),
+            );
+        }
+        paths
+            .iter()
+            .find_map(|path| load_font(&path.to_string_lossy(), 11))
+    })
+    .as_ref()
 }
 
 fn text_width(font: &FontVec, text: &str, size: f32) -> f32 {
@@ -31,10 +42,10 @@ fn text_width(font: &FontVec, text: &str, size: f32) -> f32 {
 
 fn fitted_size(font: &FontVec, text: &str, preferred: f32, minimum: f32) -> f32 {
     let width = text_width(font, text, preferred);
-    if width <= (WIDTH - 4) as f32 {
+    if width <= (WIDTH - 2) as f32 {
         preferred
     } else {
-        (preferred * (WIDTH - 4) as f32 / width).max(minimum)
+        (preferred * (WIDTH - 2) as f32 / width).max(minimum)
     }
 }
 
@@ -42,17 +53,22 @@ fn draw_centered(
     alpha: &mut [u8],
     font: &FontVec,
     text: &str,
-    size: f32,
+    height: f32,
+    width: f32,
     top: f32,
     semibold: bool,
 ) {
-    let scaled = font.as_scaled(size);
-    let width = text_width(font, text, size);
-    let mut x = (WIDTH as f32 - width).max(0.0) / 2.0;
+    let scale = PxScale {
+        x: width,
+        y: height,
+    };
+    let scaled = font.as_scaled(scale);
+    let text_width = text_width(font, text, width);
+    let mut x = (WIDTH as f32 - text_width).max(0.0) / 2.0;
     let baseline = top + scaled.ascent();
     for ch in text.chars() {
         let id = scaled.glyph_id(ch);
-        let glyph = id.with_scale_and_position(size, point(x, baseline));
+        let glyph = id.with_scale_and_position(scale, point(x, baseline));
         if let Some(outlined) = font.outline_glyph(glyph) {
             let bounds = outlined.px_bounds();
             outlined.draw(|column, row, coverage| {
@@ -74,18 +90,13 @@ fn draw_centered(
 
 pub fn render(label: &str, value: &str) -> Image<'static> {
     let mut alpha = vec![0_u8; WIDTH * HEIGHT];
-    if let Some(font) = value_font() {
-        draw_centered(
-            &mut alpha,
-            font,
-            value,
-            fitted_size(font, value, 25.0, 17.0),
-            -3.5,
-            true,
-        );
+    if let Some(font) = pingfang_font() {
+        let width = fitted_size(font, value, 46.0, 20.0);
+        draw_centered(&mut alpha, font, value, 46.0, width, -7.5, true);
     }
-    if let Some(font) = label_font() {
-        draw_centered(&mut alpha, font, label, 13.0, 28.0, true);
+    if let Some(font) = pingfang_font() {
+        let width = fitted_size(font, label, 18.0, 13.0);
+        draw_centered(&mut alpha, font, label, 18.0, width, 29.5, true);
     }
     let mut rgba = Vec::with_capacity(WIDTH * HEIGHT * 4);
     for opacity in alpha {
@@ -101,10 +112,10 @@ mod tests {
     #[test]
     fn metric_icons_are_fixed_size_and_nonblank() {
         for (label, value) in [
-            ("速", "16.4"),
-            ("首", "680ms"),
-            ("量", "1.2M"),
-            ("费", "$1.24"),
+            ("TPS", "16.4"),
+            ("TTFT", "680ms"),
+            ("TOK", "1.2M"),
+            ("USD", "$1.24"),
         ] {
             let image = render(label, value);
             assert_eq!(image.width(), WIDTH as u32);
@@ -120,7 +131,7 @@ mod tests {
 
     #[test]
     fn value_and_label_use_separate_rows() {
-        let image = render("量", "123.4M");
+        let image = render("TOK", "123.4M");
         let alpha = image
             .rgba()
             .iter()
@@ -128,7 +139,36 @@ mod tests {
             .step_by(4)
             .copied()
             .collect::<Vec<_>>();
-        assert!(alpha[..WIDTH * 27].iter().any(|value| *value > 0));
-        assert!(alpha[WIDTH * 28..].iter().any(|value| *value > 0));
+        assert!(alpha[..WIDTH * 29].iter().any(|value| *value > 0));
+        assert!(alpha[WIDTH * 30..].iter().any(|value| *value > 0));
+    }
+
+    #[test]
+    fn common_values_keep_large_type() {
+        let font = pingfang_font().expect("PingFang SC Semibold font");
+        for (_, value) in [
+            ("TPS", "21.6"),
+            ("TTFT", "18s"),
+            ("TOK", "150M"),
+            ("USD", "$116"),
+        ] {
+            let width = fitted_size(font, value, 46.0, 20.0);
+            assert!(
+                text_width(font, value, width) <= (WIDTH - 2) as f32,
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn letter_labels_fit_the_bottom_row() {
+        let font = pingfang_font().expect("PingFang SC Semibold font");
+        for label in ["TPS", "TTFT", "TOK", "USD"] {
+            let width = fitted_size(font, label, 18.0, 13.0);
+            assert!(
+                text_width(font, label, width) <= (WIDTH - 2) as f32,
+                "{label}"
+            );
+        }
     }
 }

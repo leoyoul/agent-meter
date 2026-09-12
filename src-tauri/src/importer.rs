@@ -21,6 +21,7 @@ pub struct BackendState {
     pub status: Arc<Mutex<ImportStatus>>,
     paused: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
+    refresh_requested: Arc<AtomicBool>,
 }
 
 impl BackendState {
@@ -33,6 +34,7 @@ impl BackendState {
             })),
             paused: Arc::new(AtomicBool::new(false)),
             running: Arc::new(AtomicBool::new(false)),
+            refresh_requested: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -71,11 +73,21 @@ pub fn start_background_import(app: AppHandle, state: BackendState) -> bool {
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
+        state.refresh_requested.store(true, Ordering::Release);
         return false;
     }
     state.paused.store(false, Ordering::Release);
+    state.refresh_requested.store(false, Ordering::Release);
     std::thread::spawn(move || {
-        let result = run_import(&app, &state);
+        let result = loop {
+            let result = run_import(&app, &state);
+            if state.paused.load(Ordering::Acquire)
+                || result.is_err()
+                || !state.refresh_requested.swap(false, Ordering::AcqRel)
+            {
+                break result;
+            }
+        };
         state.running.store(false, Ordering::Release);
         let mut status = state.status.lock();
         status.running = false;
@@ -122,6 +134,7 @@ fn run_import(app: &AppHandle, state: &BackendState) -> AppResult<()> {
     }
 
     let mut last_metrics_emit = Instant::now() - Duration::from_secs(1);
+    let mut last_progress_emit = Instant::now() - Duration::from_secs(1);
     for (index, file) in files.iter().enumerate() {
         if state.paused.load(Ordering::Acquire) {
             break;
@@ -140,12 +153,15 @@ fn run_import(app: &AppHandle, state: &BackendState) -> AppResult<()> {
                 .saturating_sub(accounted)
                 .saturating_add(offset.min(file.size));
             accounted = offset.min(file.size);
-            let _ = app.emit("import-progress", status.clone());
+            if last_progress_emit.elapsed() >= Duration::from_millis(250) {
+                let _ = app.emit("import-progress", status.clone());
+                last_progress_emit = Instant::now();
+            }
         }) {
             Ok(offset) => {
                 if offset > before {
                     crate::analytics::sync_codex_incremental(&conn)?;
-                    if last_metrics_emit.elapsed() >= Duration::from_millis(300) {
+                    if last_metrics_emit.elapsed() >= Duration::from_secs(1) {
                         let _ =
                             app.emit("metrics-updated", db::database_last_updated(&state.db_path));
                         last_metrics_emit = Instant::now();
@@ -193,7 +209,7 @@ fn collect_files(db_path: &Path) -> AppResult<Vec<FileEntry>> {
         if !root.is_dir() {
             continue;
         }
-        for entry in WalkDir::new(root).follow_links(false).into_iter().flatten() {
+        for entry in WalkDir::new(&root).follow_links(false).into_iter().flatten() {
             if !entry.file_type().is_file() || !db::is_rollout(entry.path()) {
                 continue;
             }
