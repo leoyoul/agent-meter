@@ -425,6 +425,7 @@ pub fn sync_all_sources(path: &Path) -> AppResult<()> {
         sync_opencode(&conn)?;
         sync_dsh(&conn)?;
         sync_evox(&conn)?;
+        sync_ccswitch(&conn)?;
         materialize_observations(&conn)?;
         reprice_conn(&conn)
     })();
@@ -856,6 +857,52 @@ fn sync_opencode(conn: &Connection) -> AppResult<()> {
         "INSERT INTO source_sync_cursors(source_id,updated_ms,external_id) VALUES (?1,?2,?3)
          ON CONFLICT(source_id) DO UPDATE SET updated_ms=excluded.updated_ms,external_id=excluded.external_id",
         params![source_id, latest.0, latest.1],
+    ).map_err(db::to_error)?;
+    Ok(())
+}
+
+fn sync_ccswitch(conn: &Connection) -> AppResult<()> {
+    let Some((source_id, path)) = source(conn, "ccswitch_sqlite")? else { return Ok(()); };
+    if !Path::new(&path).is_file() { return Ok(()); }
+    let remote = readonly(Path::new(&path))?;
+    let (cursor_ms, cursor_id) = conn.query_row(
+        "SELECT updated_ms,external_id FROM source_sync_cursors WHERE source_id=?1",
+        [source_id], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+    ).optional().map_err(db::to_error)?.unwrap_or((0, String::new()));
+    let mut stmt = remote.prepare(
+        "SELECT request_id, provider_id, COALESCE(request_model, model), created_at,
+                input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+                first_token_ms, COALESCE(duration_ms, latency_ms), status_code
+         FROM proxy_request_logs
+         WHERE app_type='claude-desktop'
+           AND (created_at>?1 OR (created_at=?1 AND request_id>?2))
+         ORDER BY created_at, request_id"
+    ).map_err(db::to_error)?;
+    let rows = stmt.query_map(params![cursor_ms / 1000, cursor_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?, row.get::<_, i64>(4)?, row.get::<_, i64>(5)?,
+            row.get::<_, i64>(6)?, row.get::<_, i64>(7)?, row.get::<_, Option<i64>>(8)?,
+            row.get::<_, Option<i64>>(9)?, row.get::<_, i64>(10)?,
+        ))
+    }).map_err(db::to_error)?;
+    let mut latest = (cursor_ms / 1000, cursor_id);
+    for row in rows {
+        let (id, provider, model, created_s, input, output, cache_read, cache_write, first, duration, status_code) = row.map_err(db::to_error)?;
+        let completed_ms = created_s.saturating_mul(1000);
+        let duration_ms = duration.map(|v| v.max(0));
+        let started_ms = completed_ms.saturating_sub(duration_ms.unwrap_or(0));
+        let status = if (200..300).contains(&status_code) { "completed" } else { "failed" };
+        let updated = Utc.timestamp_millis_opt(completed_ms).single().unwrap_or_else(Utc::now).to_rfc3339();
+        upsert_observation(conn, source_id, &id, &provider, &model, "default", started_ms,
+            Some(completed_ms), duration_ms, first.filter(|v| *v >= 0), status,
+            input.max(0), cache_read.max(0), cache_write.max(0), output.max(0), 0, &updated)?;
+        latest = (created_s, id);
+    }
+    conn.execute(
+        "INSERT INTO source_sync_cursors(source_id,updated_ms,external_id) VALUES (?1,?2,?3)
+         ON CONFLICT(source_id) DO UPDATE SET updated_ms=excluded.updated_ms,external_id=excluded.external_id",
+        params![source_id, latest.0 * 1000, latest.1],
     ).map_err(db::to_error)?;
     Ok(())
 }
@@ -2359,7 +2406,7 @@ fn metric_series(
         .into_iter()
         .map(|(bucket, (label, rows))| {
             let perf = performance
-                .into_iter()
+                .iter()
                 .filter(|row| {
                     let local = Local.timestamp_millis_opt(row.completed_at).single();
                     match (period, local) {
@@ -2741,6 +2788,24 @@ mod tests {
         let conn = db::open(&path).unwrap();
         let row: (i64,String,i64,i64,i64) = conn.query_row("SELECT count(*),status,uncached_input_tokens,cached_read_tokens,total_tokens FROM usage_observations WHERE source_id=101", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).unwrap();
         assert_eq!(row, (1, "completed".into(), 60, 30, 125));
+    }
+
+    #[test]
+    fn ccswitch_sync_imports_only_claude_desktop_and_deduplicates() {
+        let (temp, path) = empty_meter();
+        let remote_path = temp.path().join("cc-switch.sqlite");
+        let remote = Connection::open(&remote_path).unwrap();
+        remote.execute_batch("CREATE TABLE proxy_request_logs(request_id TEXT PRIMARY KEY,provider_id TEXT NOT NULL,app_type TEXT NOT NULL,model TEXT NOT NULL,request_model TEXT,input_tokens INTEGER NOT NULL DEFAULT 0,output_tokens INTEGER NOT NULL DEFAULT 0,cache_read_tokens INTEGER NOT NULL DEFAULT 0,cache_creation_tokens INTEGER NOT NULL DEFAULT 0,first_token_ms INTEGER,duration_ms INTEGER,latency_ms INTEGER,status_code INTEGER NOT NULL,created_at INTEGER NOT NULL);").unwrap();
+        remote.execute("INSERT INTO proxy_request_logs VALUES ('claude-1','provider','claude-desktop','qwen','claude-opus-5',100,20,30,40,250,1000,1000,200,1000)", []).unwrap();
+        remote.execute("INSERT INTO proxy_request_logs VALUES ('other-1','provider','codex','gpt','gpt-5.5',999,999,999,999,1,1,1,200,1001)", []).unwrap();
+        let conn = db::open(&path).unwrap();
+        conn.execute("INSERT INTO sources(id,name,root_path,source_kind,enabled) VALUES (105,'Claude',?1,'ccswitch_sqlite',1)", [remote_path.to_string_lossy().as_ref()]).unwrap();
+        drop(conn);
+        sync_all_sources(&path).unwrap();
+        sync_all_sources(&path).unwrap();
+        let conn = db::open(&path).unwrap();
+        let row: (i64, String, String, i64, i64, i64, i64, i64) = conn.query_row("SELECT count(*),model,provider,uncached_input_tokens,cached_read_tokens,cached_write_tokens,output_tokens,total_tokens FROM usage_observations WHERE source_id=105", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))).unwrap();
+        assert_eq!(row, (1, "claude-opus-5".into(), "provider".into(), 100, 30, 40, 20, 190));
     }
 
     #[test]

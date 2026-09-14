@@ -442,12 +442,10 @@ fn update_tray_titles(app: &AppHandle, state: &BackendState) {
         .as_ref()
         .map(|value| value.1.as_str())
         .unwrap_or("全部来源");
-    let unavailable_reason = settings.active_source_kind.as_deref().and_then(|kind| {
+    let unavailable_reason = settings.active_source_kind.as_deref().and_then(|_kind| {
         let scope = scope.as_ref()?;
         if !scope.2 {
             Some("该来源已停用")
-        } else if kind == "claude_desktop" {
-            Some("未发现可统计的本地 Token 记录")
         } else if !std::path::Path::new(&scope.3).exists() {
             Some("本机未发现该数据源")
         } else {

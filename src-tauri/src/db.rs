@@ -185,8 +185,8 @@ fn known_source_paths() -> Vec<(String, PathBuf, &'static str)> {
         ("DSH".into(), home.join(".dsh/sessions"), "dsh_zstd"),
         (
             "Claude".into(),
-            home.join("Library/Application Support/Claude"),
-            "claude_desktop",
+            home.join(".cc-switch/cc-switch.db"),
+            "ccswitch_sqlite",
         ),
         (
             "EvoX".into(),
@@ -197,6 +197,21 @@ fn known_source_paths() -> Vec<(String, PathBuf, &'static str)> {
 }
 
 pub fn sync_known_sources(conn: &Connection) -> AppResult<()> {
+    // Migrate the pre-CC Switch Claude source in place so upgrades do not create
+    // a second Claude tab for the old Application Support directory.
+    if let Some(home) = dirs::home_dir() {
+        conn.execute(
+            "UPDATE sources SET root_path=?1, source_kind='ccswitch_sqlite'
+             WHERE source_kind='claude_desktop' AND name='Claude'
+               AND NOT EXISTS (SELECT 1 FROM sources WHERE root_path=?1)",
+            params![home.join(".cc-switch/cc-switch.db").to_string_lossy()],
+        ).map_err(to_error)?;
+        conn.execute(
+            "DELETE FROM sources WHERE source_kind='claude_desktop' AND name='Claude'
+              AND EXISTS (SELECT 1 FROM sources WHERE source_kind='ccswitch_sqlite' AND name='Claude')",
+            [],
+        ).map_err(to_error)?;
+    }
     for (name, path, source_kind) in known_source_paths() {
         conn.execute(
             "INSERT INTO sources(name, root_path, source_kind, enabled)
@@ -238,7 +253,7 @@ pub fn discover_sources(path: &Path) -> AppResult<Vec<SourceInfo>> {
         let source_path = Path::new(&root_path);
         let available = if matches!(
             source_kind.as_str(),
-            "codex_jsonl" | "dsh_zstd" | "claude_desktop" | "evox_observability"
+            "codex_jsonl" | "dsh_zstd" | "evox_observability"
         ) {
             source_path.is_dir()
         } else {
@@ -246,8 +261,6 @@ pub fn discover_sources(path: &Path) -> AppResult<Vec<SourceInfo>> {
         };
         let (file_count, total_bytes) = if source_kind == "codex_jsonl" {
             source_inventory(source_path)
-        } else if source_kind == "claude_desktop" {
-            (0, 0)
         } else if source_kind == "dsh_zstd" {
             extension_inventory(source_path, "zstd")
         } else if source_kind == "evox_observability" {
@@ -268,18 +281,12 @@ pub fn discover_sources(path: &Path) -> AppResult<Vec<SourceInfo>> {
             total_bytes,
             last_scan_at,
             error,
-            data_capability: if source_kind == "claude_desktop" {
-                "noUsageLog".into()
-            } else {
-                "metrics".into()
-            },
-            limitation: if source_kind == "claude_desktop" && file_count == 0 {
-                Some("未发现可统计的本地 Token 记录；当前版本可能未暴露公开用量日志".into())
-            } else if source_kind == "claude_desktop" {
-                None
-            } else {
-                None
-            },
+            data_capability: "metrics".into(),
+            limitation: if source_kind == "ccswitch_sqlite" && file_count == 0 {
+                Some("未发现 CC Switch 数据库；仅统计经过 CC Switch 代理的 Claude Desktop 请求".into())
+            } else if source_kind == "ccswitch_sqlite" {
+                Some("仅统计经过 CC Switch 代理的 Claude Desktop 请求".into())
+            } else { None },
         });
     }
     Ok(result)

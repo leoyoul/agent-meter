@@ -16,7 +16,7 @@ const sources: SourceInfo[] = [
   { id: 2, name: 'ZCode', sourceKind: 'zcode_sqlite', dataCapability: 'metrics', rootPath: '~/.zcode/cli/db/db.sqlite', enabled: true, available: true, fileCount: 1, totalBytes: 8_912_896, lastScanAt: iso(-1), error: null },
   { id: 3, name: 'OpenCode', sourceKind: 'opencode_sqlite', dataCapability: 'metrics', rootPath: '~/.local/share/opencode/opencode.db', enabled: true, available: true, fileCount: 1, totalBytes: 29_360_128, lastScanAt: iso(-1), error: null },
   { id: 4, name: 'DSH', sourceKind: 'dsh_zstd', dataCapability: 'metrics', rootPath: '~/.dsh/sessions', enabled: true, available: true, fileCount: 37, totalBytes: 38_797_312, lastScanAt: iso(-1), error: null },
-  { id: 5, name: 'Claude', sourceKind: 'claude_desktop', dataCapability: 'noUsageLog', limitation: '未发现可统计的本地 Token 记录', rootPath: '~/Library/Application Support/Claude', enabled: true, available: true, fileCount: 0, totalBytes: 0, lastScanAt: null, error: null },
+  { id: 5, name: 'Claude', sourceKind: 'ccswitch_sqlite', dataCapability: 'metrics', limitation: '仅统计经过 CC Switch 代理的 Claude Desktop 请求', rootPath: '~/.cc-switch/cc-switch.db', enabled: true, available: true, fileCount: 1, totalBytes: 0, lastScanAt: iso(-1), error: null },
   { id: 6, name: 'EvoX', sourceKind: 'evox_observability', dataCapability: 'metrics', rootPath: '~/.evox/agent/observability', enabled: true, available: true, fileCount: 12, totalBytes: 1_468_006, lastScanAt: iso(-1), error: null },
 ]
 const rows: ModelEffortStat[] = [
@@ -47,7 +47,7 @@ const pricingModels = (): PricingModel[] => [
   { vendor: 'Meta', model: 'muse-spark-1.3', callCount: 24, totalTokens: 600_600, pricingStatus: 'partial', rates: pricingRates.filter(rate => rate.model === 'muse-spark-1.3') },
   { vendor: 'unknown', model: 'unpriced-model', callCount: 8, totalTokens: 88_000, pricingStatus: 'unpriced', rates: [] },
 ]
-const integrity: DataIntegrityStatus = { reconciled: true, sources: sources.filter(source => source.dataCapability === 'metrics').map(source => ({ sourceId: source.id, sourceName: source.name, rawCallCount: source.id === 1 ? 463 : 24, indexedCallCount: source.id === 1 ? 463 : 24, difference: 0, unreadBytes: 0, parseErrorCount: 0, lastCallAt: iso(-1), syncDelayMs: 60_000, reconciled: true, error: null })) }
+const integrity: DataIntegrityStatus = { reconciled: true, sources: sources.filter(source => source.dataCapability === 'metrics').map(source => ({ sourceId: source.id, sourceName: source.name, rawCallCount: source.id === 1 ? 463 : source.id === 5 ? 42 : 24, indexedCallCount: source.id === 1 ? 463 : source.id === 5 ? 42 : 24, difference: 0, unreadBytes: 0, parseErrorCount: 0, lastCallAt: iso(-1), syncDelayMs: 60_000, reconciled: true, error: null })) }
 const call = async <T>(command: string, args?: Record<string, unknown>, fallback?: () => T): Promise<T> => { if (isTauri()) return invoke<T>(command, args); await new Promise(resolve => setTimeout(resolve, 20)); if (!fallback) throw new Error(`Mock not implemented: ${command}`); return fallback() }
 const filtered = (filters: AnalyticsFilters) => rows.filter(row => (!filters.sourceId || row.sourceId === filters.sourceId) && (!filters.model || row.model === filters.model) && (!filters.reasoningEffort || row.reasoningEffort === filters.reasoningEffort))
 

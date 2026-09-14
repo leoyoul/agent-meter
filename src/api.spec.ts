@@ -62,10 +62,10 @@ describe('browser mock API v0.4', () => {
     expect(updated.activeSourceKind).toBe('dsh_zstd')
   })
 
-  it('discovers all sources and exposes Claude as detection-only', async () => {
+  it('discovers all sources and exposes Claude proxy metrics', async () => {
     const discovered = await meterApi.discoverSources()
     expect(discovered.map(source => source.name)).toEqual(['Codex', 'ZCode', 'OpenCode', 'DSH', 'Claude', 'EvoX'])
-    expect(discovered.find(source => source.name === 'Claude')).toMatchObject({ dataCapability: 'noUsageLog', limitation: '未发现可统计的本地 Token 记录' })
+    expect(discovered.find(source => source.name === 'Claude')).toMatchObject({ dataCapability: 'metrics', sourceKind: 'ccswitch_sqlite', rootPath: '~/.cc-switch/cc-switch.db' })
   })
 
   it('supports source and import lifecycle controls', async () => {

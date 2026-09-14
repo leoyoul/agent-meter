@@ -3,7 +3,7 @@
 [![CI](https://github.com/leoyoul/agent-meter/actions/workflows/ci.yml/badge.svg)](https://github.com/leoyoul/agent-meter/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-2ea44f.svg)](LICENSE)
 
-Agent Meter 是一个本地优先的 macOS 菜单栏应用，用“速、首、量、费”观察 Codex、ZCode、OpenCode、DSH 和 EvoX 的本机模型调用，并检测 Claude Desktop 的本地数据能力。
+Agent Meter 是一个本地优先的 macOS 菜单栏应用，用“速、首、量、费”观察 Codex、ZCode、OpenCode、DSH、Claude Desktop 和 EvoX 的本机模型调用。
 
 > Agent Meter 是社区维护的非官方工具，与 OpenAI、Anthropic 及所支持 Agent 的开发者无隶属或背书关系。
 
@@ -49,10 +49,10 @@ Agent Meter 是一个本地优先的 macOS 菜单栏应用，用“速、首、�
 | ZCode | `~/.zcode/cli/db/db.sqlite` 的 `model_usage` | 最近调用重叠同步 |
 | OpenCode | `~/.local/share/opencode/opencode.db` | `time_updated + id` 游标 |
 | DSH | `~/.dsh/sessions/**/*.jsonl.zstd` | 压缩文件大小与修改时间 |
-| Claude Desktop | `~/Library/Application Support/Claude` | 仅检测；未发现稳定的本地 Token 日志 |
+| Claude Desktop | `~/.cc-switch/cc-switch.db` 的 `proxy_request_logs` | `created_at + request_id` 增量同步，仅 `app_type=claude-desktop` |
 | EvoX | `~/.evox/agent/observability/*.jsonl` | 文件变化与稳定调用 ID 去重 |
 
-应用不会扫描 ZCode 的完整目录，也不会读取 Claude 的 IndexedDB、Cache、Cookies 或对话正文。用量调用与性能样本分表保存，Codex 活动目录与归档目录继续按 `response_id` 去重。
+应用不会扫描 ZCode 的完整目录，也不会读取 Claude Desktop 的 IndexedDB、Cache、Cookies 或对话正文。Claude 仅统计经过 CC Switch 代理的请求；直连 Anthropic 的请求不会纳入。用量调用与性能样本分表保存，Codex 活动目录与归档目录继续按 `response_id` 去重。
 
 ## 安装
 
@@ -93,4 +93,4 @@ npm run tauri -- build --target aarch64-apple-darwin
 
 ### Claude Desktop 数据边界
 
-当前检查的 Claude Desktop 版本未发现可验证的公开 Token 用量记录，因此仍标记为不可统计。应用不会读取 IndexedDB、Cache、Cookies、会话存储或对话正文，也不会从字段字符串推断用量或拦截网络请求。Claude Desktop Token 解析器尚未实现；本版本不宣称支持其 Token 统计。
+Agent Meter 只读 CC Switch 的 `~/.cc-switch/cc-switch.db`，导入 `proxy_request_logs` 中 `app_type=claude-desktop` 的调用记录。记录中的 `request_model`、输入/输出/缓存 Token、首 Token 延迟、总延迟和状态码用于计算指标。应用不会读取 Claude Desktop 的 IndexedDB、Cache、Cookies、会话存储或对话正文，也不会调用 Anthropic 管理 API。未经过 CC Switch 代理的 Claude Desktop 请求无法从本地可靠恢复。
