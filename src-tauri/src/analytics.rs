@@ -417,6 +417,10 @@ pub fn migrate(conn: &Connection) -> AppResult<()> {
 
 pub fn sync_all_sources(path: &Path) -> AppResult<()> {
     let conn = db::open(path)?;
+    // Keep source migrations effective for databases created by older releases.
+    // This is also needed when a long-running app receives an upgraded backend
+    // without going through a clean database initialization path.
+    db::sync_known_sources(&conn)?;
     conn.execute_batch("BEGIN IMMEDIATE")
         .map_err(db::to_error)?;
     let result = (|| {

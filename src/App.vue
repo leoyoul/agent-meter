@@ -26,7 +26,7 @@ const error = ref('')
 const lastAction = ref('')
 const autostartEnabled = ref(false)
 const appSettings = ref<AppSettings>({ menuMetrics: { todayTokens: true, ttft: false, effectiveTps: false, estimatedCost: false }, showAppIcon: false, menuPeriod: 'realtime', activeSourceKind: null, updates: { automaticCheck: true, lastCheckedAt: null } })
-const updateState = ref<AppUpdateState>({ phase: 'idle', currentVersion: '0.4.2', downloadedBytes: 0 })
+const updateState = ref<AppUpdateState>({ phase: 'idle', currentVersion: '0.4.4', downloadedBytes: 0 })
 const unlisteners: Array<() => void> = []
 let updateDelay: ReturnType<typeof setTimeout> | undefined
 let updateInterval: ReturnType<typeof setInterval> | undefined
