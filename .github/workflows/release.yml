@@ -36,7 +36,7 @@ jobs:
           tagName: v__VERSION__
           releaseName: Agent Meter v__VERSION__
           releaseBody: |
-            Agent Meter v0.4.4 接入 CC Switch 的 Claude Desktop 用量统计：只读 ~/.cc-switch/cc-switch.db 中的 proxy_request_logs，仅纳入经过 CC Switch 代理的 claude-desktop 请求，并按 request_model、Token、首 Token 延迟和总延迟计算指标。
+            Agent Meter v0.4.5 接入 CC Switch 的 Claude Desktop 用量统计，并新增菜单栏与设置页更新入口、启动检查和每日自动检查。
 
             Claude Desktop 数据不会读取 IndexedDB、Cache、Cookies 或对话正文，也不会调用 Anthropic 管理 API。直连 Anthropic 的请求不会纳入统计。
 

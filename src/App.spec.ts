@@ -64,7 +64,7 @@ describe('Agent Meter v0.4 windows', () => {
     wrapper.unmount()
   })
 
-  it('renders settings as a standalone page and toggles menu metrics', async () => {
+  it('renders settings as a standalone page and keeps automatic updates enabled', async () => {
     window.history.replaceState({}, '', '/?view=settings')
     const wrapper = mount(App)
     await vi.waitFor(() => expect(wrapper.text()).toContain('菜单栏、数据源与应用更新'))
@@ -84,11 +84,13 @@ describe('Agent Meter v0.4 windows', () => {
     wrapper.unmount()
   })
 
-  it('keeps update checks in the standalone settings page', async () => {
+  it('checks for updates from the version and settings controls', async () => {
     window.history.replaceState({}, '', '/?view=settings')
     const wrapper = mount(App)
     await vi.waitFor(() => expect(wrapper.text()).toContain('API 等价价目'))
-    const button = wrapper.findAll('button').find(item => item.text().includes('检查更新'))!
+    expect(wrapper.get('.version-button').text()).toBe('v0.4.5')
+    await wrapper.get('.version-button').trigger('click')
+    const button = wrapper.findAll('button').find(item => item.text().includes('检查并安装'))!
     await button.trigger('click')
     await vi.waitFor(() => expect(wrapper.text()).toContain('已是最新版'))
     wrapper.unmount()

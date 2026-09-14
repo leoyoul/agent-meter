@@ -298,6 +298,7 @@ fn app_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
 fn tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let dashboard = MenuItem::with_id(app, "dashboard", "打开看板", true, None::<&str>)?;
     let refresh = MenuItem::with_id(app, "refresh", "刷新", true, None::<&str>)?;
+    let update = MenuItem::with_id(app, "check-update", "检查更新", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "设置", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出 Agent Meter", true, None::<&str>)?;
     Menu::with_items(
@@ -306,6 +307,7 @@ fn tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
             &dashboard,
             &PredefinedMenuItem::separator(app)?,
             &refresh,
+            &update,
             &settings,
             &PredefinedMenuItem::separator(app)?,
             &quit,
@@ -421,6 +423,12 @@ fn setup_trays(app: &tauri::App, settings: &AppSettings) -> tauri::Result<()> {
         "refresh" => {
             let state = app.state::<BackendState>();
             importer::start_background_import(app.clone(), state.inner().clone());
+        }
+        "check-update" => {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.emit("update-requested", ());
+                show_main_window(app);
+            }
         }
         "settings" | "app-settings" => {
             show_settings(app);

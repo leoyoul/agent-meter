@@ -106,3 +106,4 @@ button, select { font: inherit; color: inherit; } button { cursor: pointer; }
 .editor-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
 @media (prefers-color-scheme: dark) { .price-editor { background: rgba(23,29,36,.98); }.form-grid input { background: rgba(5,9,14,.32); } }
 @media (max-width: 600px) { .pricing-toolbar { align-items: stretch; flex-direction: column; }.search-box { width: 100%; }.form-grid { grid-template-columns: 1fr; }.form-grid .wide { grid-column: auto; } }
+.version-button { border: 0; padding: 4px 6px; color: var(--muted); background: transparent; font: inherit; cursor: pointer; border-radius: 5px; }.version-button:hover { color: var(--accent); background: rgba(255,255,255,.55); }.version-button:disabled { cursor: default; opacity: .65; }.update-policy { color: var(--accent); font-size: 11px; white-space: nowrap; }
