@@ -1,11 +1,22 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { meterApi } from './api'
 
 const invokeMock = vi.hoisted(() => vi.fn())
+const checkMock = vi.hoisted(() => vi.fn())
+const getVersionMock = vi.hoisted(() => vi.fn())
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeMock }))
+vi.mock('@tauri-apps/api/app', () => ({ getVersion: getVersionMock }))
+vi.mock('@tauri-apps/plugin-updater', () => ({ check: checkMock }))
 
 describe('browser mock API v0.4', () => {
+  afterEach(() => {
+    delete (window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__
+    invokeMock.mockReset()
+    checkMock.mockReset()
+    getVersionMock.mockReset()
+  })
+
   it('returns the four-metric contract', async () => {
     const filters = { period: 'realtime' as const }
     const [summary, series, matrix] = await Promise.all([meterApi.queryMetricSummary(filters), meterApi.queryMetricSeries(filters), meterApi.queryModelEffortStats(filters)])
@@ -52,6 +63,53 @@ describe('browser mock API v0.4', () => {
     const catalog = await meterApi.getPricingCatalogStatus()
     expect(catalog.version).toMatch(/^\d{4}-\d{2}-\d{2}/)
     expect(catalog.rates.every(rate => rate.sourceUrl.startsWith('https://'))).toBe(true)
+  })
+
+  it('does not claim that a browser preview is up to date', async () => {
+    const state = await meterApi.checkForUpdate()
+
+    expect(state.phase).toBe('unavailable')
+    expect(state.platform).toBe('browser')
+    expect(state.message).toContain('本地预览不支持')
+    expect(state.currentVersion).toBe('0.4.7')
+  })
+
+  it('reports an available update for the current Tauri target', async () => {
+    Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {}, configurable: true })
+    getVersionMock.mockResolvedValue('0.4.5')
+    invokeMock.mockImplementation(async (command: string) => command === 'get_update_target' ? 'darwin-aarch64' : undefined)
+    checkMock.mockResolvedValue({ version: '0.4.7', body: '更新说明', close: vi.fn() })
+
+    const state = await meterApi.checkForUpdate()
+
+    expect(state).toMatchObject({ phase: 'available', currentVersion: '0.4.5', platform: 'darwin-aarch64', version: '0.4.7' })
+    expect(checkMock).toHaveBeenCalledWith({ timeout: 20_000 })
+  })
+
+  it('reports a current version only after the updater confirms no newer release', async () => {
+    Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {}, configurable: true })
+    getVersionMock.mockResolvedValue('0.4.7')
+    invokeMock.mockResolvedValue('darwin-aarch64')
+    checkMock.mockResolvedValue(null)
+
+    const state = await meterApi.checkForUpdate()
+
+    expect(state).toMatchObject({ phase: 'current', currentVersion: '0.4.7', platform: 'darwin-aarch64' })
+    expect(state.message).toContain('没有高于当前版本')
+  })
+
+  it('distinguishes an unavailable update target from a network failure', async () => {
+    Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {}, configurable: true })
+    getVersionMock.mockResolvedValue('0.4.5')
+    invokeMock.mockResolvedValue('darwin-aarch64')
+    checkMock.mockRejectedValueOnce(new Error('None of the fallback platforms [darwin-aarch64-app, darwin-aarch64] were found'))
+
+    const unavailable = await meterApi.checkForUpdate()
+    expect(unavailable).toMatchObject({ phase: 'unavailable', platform: 'darwin-aarch64', currentVersion: '0.4.5' })
+    expect(unavailable.message).toContain('没有找到适配')
+
+    checkMock.mockRejectedValueOnce(new Error('network timeout'))
+    await expect(meterApi.checkForUpdate()).rejects.toThrow('network timeout')
   })
 
   it('supports pricing CRUD and data integrity status', async () => {

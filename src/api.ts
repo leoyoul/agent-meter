@@ -5,8 +5,10 @@ import { disable, enable, isEnabled } from '@tauri-apps/plugin-autostart'
 import { relaunch } from '@tauri-apps/plugin-process'
 import { check, type Update } from '@tauri-apps/plugin-updater'
 import type { AnalyticsFilters, AppSettings, AppUpdateState, DashboardData, DataIntegrityStatus, ImportStatus, MetricSeriesPoint, MetricSummary, ModelEffortStat, PricingCatalogStatus, PricingModel, PricingRate, PricingRateInput, SourceInfo } from './shared'
+import packageMetadata from '../package.json'
 
 export type MeterEvent = 'import-progress' | 'metrics-updated' | 'source-error' | 'settings-updated' | 'sources-updated' | 'update-requested'
+export const appVersion = packageMetadata.version
 const isTauri = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
 const iso = (minutes = 0) => new Date(Date.now() + minutes * 60_000).toISOString()
 const tokenSet = (uncachedInput: number, cachedRead: number, cachedWrite: number, output: number, reasoning: number) => ({ uncachedInput, cachedRead, cachedWrite, output, reasoning, total: uncachedInput + cachedRead + cachedWrite + output })
@@ -86,6 +88,8 @@ const pricingModels = (): PricingModel[] => [
 const integrity: DataIntegrityStatus = { reconciled: true, sources: sources.filter(source => source.dataCapability === 'metrics').map(source => ({ sourceId: source.id, sourceName: source.name, rawCallCount: source.id === 1 ? 463 : source.id === 5 ? 42 : 24, indexedCallCount: source.id === 1 ? 463 : source.id === 5 ? 42 : 24, difference: 0, unreadBytes: 0, parseErrorCount: 0, lastCallAt: iso(-1), syncDelayMs: 60_000, reconciled: true, error: null })) }
 const call = async <T>(command: string, args?: Record<string, unknown>, fallback?: () => T): Promise<T> => { if (isTauri()) return invoke<T>(command, args); await new Promise(resolve => setTimeout(resolve, 20)); if (!fallback) throw new Error(`Mock not implemented: ${command}`); return fallback() }
 const filtered = (filters: AnalyticsFilters) => rows.filter(row => (!filters.sourceId || row.sourceId === filters.sourceId) && (!filters.model || row.model === filters.model) && (!filters.reasoningEffort || row.reasoningEffort === filters.reasoningEffort))
+const errorMessage = (reason: unknown) => reason instanceof Error ? reason.message : String(reason)
+const isUnavailablePlatformError = (message: string) => /platform.*not found|fallback platforms|target[s]?.*not found/i.test(message)
 
 export const meterApi = {
   isTauri,
@@ -107,9 +111,36 @@ export const meterApi = {
   updateSource: (id: number, enabled: boolean) => call<SourceInfo>('update_source', { sourceId: id, enabled }, () => { const source = sources.find(item => item.id === id)!; source.enabled = enabled; return { ...source } }),
   getAppSettings: () => call<AppSettings>('get_app_settings', undefined, () => structuredClone(mockSettings)),
   updateAppSettings: (settings: AppSettings) => call<AppSettings>('update_app_settings', { settings }, () => (mockSettings = structuredClone(settings))),
-  getCurrentVersion: async () => isTauri() ? getVersion() : '0.4.5',
-  checkForUpdate: async (): Promise<AppUpdateState> => { const currentVersion = await meterApi.getCurrentVersion(); if (!isTauri()) return { phase: 'current', currentVersion, downloadedBytes: 0 }; if (pendingUpdate) { await pendingUpdate.close(); pendingUpdate = null }; const update = await check({ timeout: 20_000 }); if (!update) return { phase: 'current', currentVersion, downloadedBytes: 0 }; pendingUpdate = update; return { phase: 'available', currentVersion, version: update.version, notes: update.body, downloadedBytes: 0 } },
-  downloadAndInstallUpdate: async (onState: (state: AppUpdateState) => void) => { const currentVersion = await meterApi.getCurrentVersion(); if (!pendingUpdate) throw new Error('没有可安装的更新，请先检查更新'); const update = pendingUpdate; let downloadedBytes = 0; let totalBytes: number | undefined; await update.download(event => { if (event.event === 'Started') totalBytes = event.data.contentLength; if (event.event === 'Progress') downloadedBytes += event.data.chunkLength; onState({ phase: 'downloading', currentVersion, version: update.version, notes: update.body, downloadedBytes, totalBytes }) }, { timeout: 120_000 }); await meterApi.pauseImport(); await update.install(); onState({ phase: 'ready', currentVersion, version: update.version, downloadedBytes, totalBytes }); await relaunch() },
+  getCurrentVersion: async () => isTauri() ? getVersion() : appVersion,
+  checkForUpdate: async (): Promise<AppUpdateState> => {
+    const currentVersion = await meterApi.getCurrentVersion()
+    if (!isTauri()) return { phase: 'unavailable', currentVersion, platform: 'browser', message: '本地预览不支持应用更新检查，请使用正式安装包', downloadedBytes: 0 }
+    const platform = await call<string>('get_update_target', undefined, () => 'unknown')
+    if (pendingUpdate) { await pendingUpdate.close(); pendingUpdate = null }
+    try {
+      const update = await check({ timeout: 20_000 })
+      if (!update) return { phase: 'current', currentVersion, platform, message: `已确认 ${platform} 没有高于当前版本的更新`, downloadedBytes: 0 }
+      pendingUpdate = update
+      return { phase: 'available', currentVersion, platform, version: update.version, notes: update.body, downloadedBytes: 0 }
+    } catch (reason) {
+      const error = errorMessage(reason)
+      if (isUnavailablePlatformError(error)) return { phase: 'unavailable', currentVersion, platform, message: `没有找到适配 ${platform} 的更新包`, error, downloadedBytes: 0 }
+      throw reason
+    }
+  },
+  downloadAndInstallUpdate: async (onState: (state: AppUpdateState) => void) => {
+    const currentVersion = await meterApi.getCurrentVersion()
+    const platform = isTauri() ? await call<string>('get_update_target', undefined, () => 'unknown') : 'browser'
+    if (!pendingUpdate) throw new Error('没有可安装的更新，请先检查更新')
+    const update = pendingUpdate
+    let downloadedBytes = 0
+    let totalBytes: number | undefined
+    await update.download(event => { if (event.event === 'Started') totalBytes = event.data.contentLength; if (event.event === 'Progress') downloadedBytes += event.data.chunkLength; onState({ phase: 'downloading', currentVersion, platform, version: update.version, notes: update.body, downloadedBytes, totalBytes }) }, { timeout: 120_000 })
+    await meterApi.pauseImport()
+    await update.install()
+    onState({ phase: 'ready', currentVersion, platform, version: update.version, downloadedBytes, totalBytes })
+    await relaunch()
+  },
   isAutostartEnabled: async () => isTauri() ? isEnabled() : mockAutostart,
   setAutostartEnabled: async (enabledValue: boolean) => { if (isTauri()) enabledValue ? await enable() : await disable(); else mockAutostart = enabledValue; return enabledValue },
   showDashboardWindow: () => call<void>('show_dashboard_window', undefined, () => undefined),

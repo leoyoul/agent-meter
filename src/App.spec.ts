@@ -1,7 +1,7 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import App from './App.vue'
-import { meterApi } from './api'
+import { appVersion, meterApi } from './api'
 
 describe('Agent Meter v0.4 windows', () => {
   beforeEach(async () => {
@@ -89,11 +89,11 @@ describe('Agent Meter v0.4 windows', () => {
     window.history.replaceState({}, '', '/?view=settings')
     const wrapper = mount(App)
     await vi.waitFor(() => expect(wrapper.text()).toContain('API 等价价目'))
-    expect(wrapper.get('.version-button').text()).toBe('v0.4.5')
+    expect(wrapper.get('.version-button').text()).toBe(`v${appVersion}`)
     await wrapper.get('.version-button').trigger('click')
     const button = wrapper.findAll('button').find(item => item.text().includes('检查并安装'))!
     await button.trigger('click')
-    await vi.waitFor(() => expect(wrapper.text()).toContain('已是最新版'))
+    await vi.waitFor(() => expect(wrapper.text()).toContain('本地预览不支持应用更新检查'))
     wrapper.unmount()
   })
 })

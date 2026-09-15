@@ -8,8 +8,8 @@ export interface AppSettings {
   updates: { automaticCheck: boolean; lastCheckedAt?: string | null }
 }
 
-export type UpdatePhase = 'idle' | 'checking' | 'available' | 'current' | 'downloading' | 'ready' | 'error'
-export interface AppUpdateState { phase: UpdatePhase; currentVersion: string; version?: string; notes?: string; downloadedBytes: number; totalBytes?: number; error?: string }
+export type UpdatePhase = 'idle' | 'checking' | 'available' | 'current' | 'unavailable' | 'downloading' | 'ready' | 'error'
+export interface AppUpdateState { phase: UpdatePhase; currentVersion: string; platform?: string; version?: string; notes?: string; message?: string; downloadedBytes: number; totalBytes?: number; error?: string }
 export interface AnalyticsFilters { period: MetricPeriod; sourceId?: number; model?: string; reasoningEffort?: string }
 export type DataCapability = 'metrics' | 'noUsageLog'
 export interface SourceInfo { id: number; name: string; sourceKind: string; dataCapability: DataCapability; limitation?: string | null; rootPath: string; enabled: boolean; available: boolean; fileCount: number; totalBytes: number; lastScanAt: string | null; error: string | null }

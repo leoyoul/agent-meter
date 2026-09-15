@@ -17,6 +17,7 @@
   --shadow: 0 15px 40px rgba(36,49,68,.09), inset 0 1px rgba(255,255,255,.72);
 }
 * { box-sizing: border-box; }
+.unavailable-text { color: var(--muted); }
 html, body, #app { min-width: 320px; min-height: 100%; margin: 0; }
 body { min-height: 100vh; color: var(--text); background: linear-gradient(135deg, rgba(55,111,157,.09), transparent 40%), linear-gradient(315deg, rgba(40,132,106,.06), transparent 44%), var(--solid); }
 button, select { font: inherit; color: inherit; } button { cursor: pointer; }

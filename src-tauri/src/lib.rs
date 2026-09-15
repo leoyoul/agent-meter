@@ -193,6 +193,15 @@ fn get_app_settings(state: State<'_, SettingsState>) -> AppSettings {
 }
 
 #[tauri::command]
+fn get_update_target() -> String {
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        value => value,
+    };
+    format!("{os}-{}", std::env::consts::ARCH)
+}
+
+#[tauri::command]
 fn update_app_settings(
     app: AppHandle,
     backend: State<'_, BackendState>,
@@ -732,6 +741,7 @@ pub fn run() {
             update_source,
             get_app_settings,
             update_app_settings,
+            get_update_target,
             show_dashboard_window,
             show_settings_window
         ])
@@ -765,6 +775,16 @@ mod tests {
         assert_eq!(compact_number(2_000_000), "2.0M");
         assert_eq!(compact_number(64_654_000), "65M");
         assert_eq!(compact_number(5_360_000_000), "5.4B");
+    }
+
+    #[test]
+    fn update_target_matches_tauri_platform_naming() {
+        let expected_os = if std::env::consts::OS == "macos" {
+            "darwin"
+        } else {
+            std::env::consts::OS
+        };
+        assert_eq!(get_update_target(), format!("{expected_os}-{}", std::env::consts::ARCH));
     }
 
     #[test]
