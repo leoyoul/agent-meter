@@ -19,18 +19,54 @@ const sources: SourceInfo[] = [
   { id: 5, name: 'Claude', sourceKind: 'ccswitch_sqlite', dataCapability: 'metrics', limitation: '仅统计经过 CC Switch 代理的 Claude Desktop 请求', rootPath: '~/.cc-switch/cc-switch.db', enabled: true, available: true, fileCount: 1, totalBytes: 0, lastScanAt: iso(-1), error: null },
   { id: 6, name: 'EvoX', sourceKind: 'evox_observability', dataCapability: 'metrics', rootPath: '~/.evox/agent/observability', enabled: true, available: true, fileCount: 12, totalBytes: 1_468_006, lastScanAt: iso(-1), error: null },
 ]
-const rows: ModelEffortStat[] = [
-  { sourceId: 1, sourceName: 'Codex', provider: 'OpenAI', model: 'gpt-6-astra', reasoningEffort: 'medium', callCount: 63, performanceSampleCount: 9, averageTtftMs: 812, averageEffectiveTps: 17.4, tokens: tokenSet(146_200, 892_400, 0, 84_600, 31_200), estimatedCostNanoUsd: 6_584_000_000, pricing: { pricedObservations: 63, totalObservations: 63, pricedTokens: 1_123_200, totalTokens: 1_123_200, ratio: 1, complete: true } },
-  { sourceId: 2, sourceName: 'ZCode', provider: 'omlx', model: 'Qwen3.8-27B-MLX-4bit', reasoningEffort: 'default', callCount: 31, performanceSampleCount: 25, averageTtftMs: 386, averageEffectiveTps: 29.8, tokens: tokenSet(97_800, 188_100, 12_400, 61_800, 18_500), estimatedCostNanoUsd: 0, pricing: { pricedObservations: 31, totalObservations: 31, pricedTokens: 360_100, totalTokens: 360_100, ratio: 1, complete: true } },
-  { sourceId: 3, sourceName: 'OpenCode', provider: 'Meta', model: 'muse-spark-1.3-contributor-free', reasoningEffort: 'medium', callCount: 24, performanceSampleCount: 18, averageTtftMs: 640, averageEffectiveTps: 22.1, tokens: tokenSet(116_400, 421_300, 8_200, 54_700, 14_300), estimatedCostNanoUsd: 23_422_600, pricing: { pricedObservations: 24, totalObservations: 24, pricedTokens: 592_400, totalTokens: 600_600, ratio: .986, complete: false } },
+interface MockPerformanceSample { ttftMs: number | null; outputTokens: number; decodeMs: number | null }
+type MockModelEffortStat = ModelEffortStat & { performanceSamples: MockPerformanceSample[] }
+type MockModelDefinition = Omit<MockModelEffortStat, 'ttftSampleCount' | 'tpsSampleCount' | 'averageTtftMs' | 'averageEffectiveTps' | 'performanceSamples'> & { performanceSamples: MockPerformanceSample[] }
+interface MockPerformanceSelection { ttft: Set<MockPerformanceSample>; tps: Set<MockPerformanceSample> }
+
+const performanceSamples = (ttftCount: number, tpsCount: number, outputTokens: number, ttftMs: number, tps: number): MockPerformanceSample[] => Array.from({ length: Math.max(ttftCount, tpsCount) }, (_, index) => {
+  const hasTps = index < tpsCount
+  const output = hasTps ? Math.floor(outputTokens / tpsCount) + (index < outputTokens % tpsCount ? 1 : 0) : 0
+  return { ttftMs: index < ttftCount ? ttftMs : null, outputTokens: output, decodeMs: hasTps ? output / tps * 1_000 : null }
+})
+
+const rawRows: MockModelDefinition[] = [
+  { sourceId: 1, sourceName: 'Codex', provider: 'OpenAI', model: 'gpt-6-astra', reasoningEffort: 'medium', callCount: 63, performanceSamples: performanceSamples(9, 9, 84_600, 812, 17.4), tokens: tokenSet(146_200, 892_400, 0, 84_600, 31_200), estimatedCostNanoUsd: 6_584_000_000, pricing: { pricedObservations: 63, totalObservations: 63, pricedTokens: 1_123_200, totalTokens: 1_123_200, ratio: 1, complete: true } },
+  { sourceId: 2, sourceName: 'ZCode', provider: 'omlx', model: 'Qwen3.8-27B-MLX-4bit', reasoningEffort: 'default', callCount: 31, performanceSamples: performanceSamples(25, 25, 61_800, 386, 29.8), tokens: tokenSet(97_800, 188_100, 12_400, 61_800, 18_500), estimatedCostNanoUsd: 0, pricing: { pricedObservations: 31, totalObservations: 31, pricedTokens: 360_100, totalTokens: 360_100, ratio: 1, complete: true } },
+  { sourceId: 3, sourceName: 'OpenCode', provider: 'Meta', model: 'muse-spark-1.3-contributor-free', reasoningEffort: 'medium', callCount: 24, performanceSamples: performanceSamples(18, 18, 54_700, 640, 22.1), tokens: tokenSet(116_400, 421_300, 8_200, 54_700, 14_300), estimatedCostNanoUsd: 23_422_600, pricing: { pricedObservations: 24, totalObservations: 24, pricedTokens: 592_400, totalTokens: 600_600, ratio: .986, complete: false } },
 ]
-const series: MetricSeriesPoint[] = Array.from({ length: 10 }, (_, i) => ({ bucket: `call-${i + 1}`, label: `${String(9 + i).padStart(2, '0')}:20`, callCount: 1, performanceSampleCount: i === 2 ? 0 : 1, averageTtftMs: i === 2 ? null : 490 + i * 32, averageEffectiveTps: i === 2 ? null : 15.2 + (i % 4) * 2.3, totalTokens: 44_000 + i * 13_700, estimatedCostNanoUsd: 52_000_000 + i * 8_900_000 }))
-const summarize = (items: ModelEffortStat[]): MetricSummary => {
+
+const selectMockPerformance = (items: MockModelEffortStat[], period: AnalyticsFilters['period']): MockPerformanceSelection => {
+  const performance = items.flatMap(row => row.performanceSamples)
+  const ttft = performance.filter(sample => sample.ttftMs != null && sample.ttftMs >= 0)
+  const tps = performance.filter(sample => sample.outputTokens > 0 && sample.decodeMs != null && sample.decodeMs >= 500)
+  return { ttft: new Set(period === 'realtime' ? ttft.slice(-10) : ttft), tps: new Set(period === 'realtime' ? tps.slice(-10) : tps) }
+}
+
+const deriveMockPerformance = (definition: MockModelDefinition, selection?: MockPerformanceSelection): MockModelEffortStat => {
+  const ttft = definition.performanceSamples.filter(sample => sample.ttftMs != null && sample.ttftMs >= 0 && (!selection || selection.ttft.has(sample)))
+  const tps = definition.performanceSamples.filter(sample => sample.outputTokens > 0 && sample.decodeMs != null && sample.decodeMs >= 500 && (!selection || selection.tps.has(sample)))
+  const totalOutput = tps.reduce((sum, sample) => sum + sample.outputTokens, 0)
+  const totalDecodeMs = tps.reduce((sum, sample) => sum + (sample.decodeMs ?? 0), 0)
+  return { ...definition, ttftSampleCount: ttft.length, tpsSampleCount: tps.length, averageTtftMs: ttft.length ? ttft.reduce((sum, sample) => sum + (sample.ttftMs ?? 0), 0) / ttft.length : null, averageEffectiveTps: totalOutput && totalDecodeMs ? totalOutput / (totalDecodeMs / 1_000) : null }
+}
+
+const rows: MockModelEffortStat[] = rawRows.map(row => deriveMockPerformance(row))
+const series: MetricSeriesPoint[] = Array.from({ length: 10 }, (_, i) => ({ bucket: `call-${i + 1}`, label: `${String(9 + i).padStart(2, '0')}:20`, callCount: 1, ttftSampleCount: i === 2 ? 0 : 1, tpsSampleCount: i === 2 ? 0 : 1, averageTtftMs: i === 2 ? null : 490 + i * 32, averageEffectiveTps: i === 2 ? null : 15.2 + (i % 4) * 2.3, totalTokens: 44_000 + i * 13_700, estimatedCostNanoUsd: 52_000_000 + i * 8_900_000 }))
+const scopedRows = (items: MockModelEffortStat[], period: AnalyticsFilters['period']): MockModelEffortStat[] => {
+  const selection = selectMockPerformance(items, period)
+  return items.map(row => deriveMockPerformance(row, selection))
+}
+
+const summarize = (items: MockModelEffortStat[], period: AnalyticsFilters['period'] = 'realtime'): MetricSummary => {
   const tokens = items.reduce((a, row) => ({ uncachedInput: a.uncachedInput + row.tokens.uncachedInput, cachedRead: a.cachedRead + row.tokens.cachedRead, cachedWrite: a.cachedWrite + row.tokens.cachedWrite, output: a.output + row.tokens.output, reasoning: a.reasoning + row.tokens.reasoning, total: a.total + row.tokens.total }), tokenSet(0, 0, 0, 0, 0))
   const pricedTokens = items.reduce((sum, row) => sum + row.pricing.pricedTokens, 0)
-  const ttft = items.flatMap(row => row.averageTtftMs == null ? [] : [row.averageTtftMs])
-  const tps = items.flatMap(row => row.averageEffectiveTps == null ? [] : [row.averageEffectiveTps])
-  return { period: 'realtime', callCount: items.reduce((sum, row) => sum + row.callCount, 0), performanceSampleCount: items.reduce((sum, row) => sum + row.performanceSampleCount, 0), averageTtftMs: ttft.length ? ttft.reduce((a, b) => a + b, 0) / ttft.length : null, averageEffectiveTps: tps.length ? tps.reduce((a, b) => a + b, 0) / tps.length : null, tokens, estimatedCostNanoUsd: items.reduce((sum, row) => sum + row.estimatedCostNanoUsd, 0), pricing: { pricedObservations: items.reduce((sum, row) => sum + row.pricing.pricedObservations, 0), totalObservations: items.reduce((sum, row) => sum + row.pricing.totalObservations, 0), pricedTokens, totalTokens: tokens.total, ratio: tokens.total ? pricedTokens / tokens.total : 1, complete: pricedTokens === tokens.total }, lastUpdatedAt: iso(-1) }
+  const selection = selectMockPerformance(items, period)
+  const ttft = [...selection.ttft]
+  const tps = [...selection.tps]
+  const totalOutput = tps.reduce((sum, sample) => sum + sample.outputTokens, 0)
+  const totalDecodeMs = tps.reduce((sum, sample) => sum + (sample.decodeMs ?? 0), 0)
+  return { period: 'realtime', callCount: items.reduce((sum, row) => sum + row.callCount, 0), ttftSampleCount: ttft.length, tpsSampleCount: tps.length, averageTtftMs: ttft.length ? ttft.reduce((sum, sample) => sum + (sample.ttftMs ?? 0), 0) / ttft.length : null, averageEffectiveTps: totalOutput && totalDecodeMs ? totalOutput / (totalDecodeMs / 1_000) : null, tokens, estimatedCostNanoUsd: items.reduce((sum, row) => sum + row.estimatedCostNanoUsd, 0), pricing: { pricedObservations: items.reduce((sum, row) => sum + row.pricing.pricedObservations, 0), totalObservations: items.reduce((sum, row) => sum + row.pricing.totalObservations, 0), pricedTokens, totalTokens: tokens.total, ratio: tokens.total ? pricedTokens / tokens.total : 1, complete: pricedTokens === tokens.total }, lastUpdatedAt: iso(-1) }
 }
 let mockStatus: ImportStatus = { running: false, paused: false, filesDone: 627, filesTotal: 627, bytesDone: 2_656_518_758, bytesTotal: 2_656_518_758, currentFile: null, startedAt: iso(-48), message: '本机指标均已同步' }
 let mockAutostart = false
@@ -57,10 +93,10 @@ export const meterApi = {
   startImport: (force = false) => call<ImportStatus>('start_import', { force }, () => (mockStatus = { ...mockStatus, running: true, paused: false, message: force ? '正在重建索引' : '正在同步本机指标' })),
   pauseImport: () => call<ImportStatus>('pause_import', undefined, () => (mockStatus = { ...mockStatus, running: false, paused: true, message: '导入已暂停' })),
   getImportStatus: () => call<ImportStatus>('get_import_status', undefined, () => ({ ...mockStatus })),
-  queryDashboard: (filters: AnalyticsFilters) => call<DashboardData>('query_dashboard', { filters }, () => ({ summary: { ...summarize(filtered(filters)), period: filters.period }, series: structuredClone(series), stats: structuredClone(filtered(filters)), importStatus: { ...mockStatus }, integrity: structuredClone(integrity) })),
-  queryMetricSummary: (filters: AnalyticsFilters) => call<MetricSummary>('query_metric_summary', { filters }, () => ({ ...summarize(filtered(filters)), period: filters.period })),
+  queryDashboard: (filters: AnalyticsFilters) => call<DashboardData>('query_dashboard', { filters }, () => { const items = scopedRows(filtered(filters), filters.period); return { summary: { ...summarize(items, filters.period), period: filters.period }, series: structuredClone(series), stats: structuredClone(items), importStatus: { ...mockStatus }, integrity: structuredClone(integrity) } }),
+  queryMetricSummary: (filters: AnalyticsFilters) => call<MetricSummary>('query_metric_summary', { filters }, () => ({ ...summarize(filtered(filters), filters.period), period: filters.period })),
   queryMetricSeries: (filters: AnalyticsFilters) => call<MetricSeriesPoint[]>('query_metric_series', { filters }, () => structuredClone(series)),
-  queryModelEffortStats: (filters: AnalyticsFilters) => call<ModelEffortStat[]>('query_model_effort_stats', { filters }, () => structuredClone(filtered(filters))),
+  queryModelEffortStats: (filters: AnalyticsFilters) => call<ModelEffortStat[]>('query_model_effort_stats', { filters }, () => structuredClone(scopedRows(filtered(filters), filters.period))),
   getDataIntegrityStatus: () => call<DataIntegrityStatus>('get_data_integrity_status', undefined, () => structuredClone(integrity)),
   getPricingCatalogStatus: () => call<PricingCatalogStatus>('get_pricing_catalog_status', undefined, pricingStatus),
   listPricingModels: () => call<PricingModel[]>('list_pricing_models', undefined, () => structuredClone(pricingModels())),

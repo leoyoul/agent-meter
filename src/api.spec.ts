@@ -13,9 +13,22 @@ describe('browser mock API v0.4', () => {
     expect(summary.averageTtftMs).toBeGreaterThan(0)
     expect(summary.averageEffectiveTps).toBeGreaterThan(0)
     expect(summary.estimatedCostNanoUsd).toBeGreaterThan(0)
-    expect(summary.callCount).toBeGreaterThan(summary.performanceSampleCount)
+    expect(summary.callCount).toBeGreaterThan(summary.ttftSampleCount)
+    expect(summary.callCount).toBeGreaterThan(summary.tpsSampleCount)
+    expect(summary.ttftSampleCount).toBe(10)
+    expect(summary.tpsSampleCount).toBe(10)
+    expect(summary.averageTtftMs).toBe(640)
+    expect(summary.averageEffectiveTps).toBe(22.1)
     expect(series).toHaveLength(10)
     expect(new Set(matrix.map(row => row.sourceName))).toEqual(new Set(['Codex', 'ZCode', 'OpenCode']))
+  })
+
+  it('aggregates all period samples instead of averaging model averages', async () => {
+    const summary = await meterApi.queryMetricSummary({ period: 'today' })
+    expect(summary.ttftSampleCount).toBe(52)
+    expect(summary.tpsSampleCount).toBe(52)
+    expect(summary.averageTtftMs).toBeCloseTo((9 * 812 + 25 * 386 + 18 * 640) / 52, 5)
+    expect(summary.averageEffectiveTps).toBeCloseTo((84_600 + 61_800 + 54_700) / (84_600 / 17.4 + 61_800 / 29.8 + 54_700 / 22.1), 5)
   })
 
   it('returns the dashboard metrics in one aggregate payload', async () => {

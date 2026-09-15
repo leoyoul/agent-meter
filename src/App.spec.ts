@@ -25,6 +25,7 @@ describe('Agent Meter v0.4 windows', () => {
     expect(wrapper.find('select option').text()).toBe('全部模型')
     expect(wrapper.findAll('.view-tabs button').map(button => button.text())).toEqual(['分析', '价格'])
     expect(wrapper.text()).toContain('来源 × 模型 × 推理强度')
+    expect(wrapper.text()).toContain('首响 10 · TPS 10')
     expect(wrapper.text()).not.toContain('主代理与子代理')
     expect(wrapper.text()).not.toContain('任务明细')
     wrapper.unmount()

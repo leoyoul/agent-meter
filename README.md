@@ -25,12 +25,12 @@ Agent Meter 是一个本地优先的 macOS 菜单栏应用，用“速、首、�
 ## 指标口径
 
 - `调用`：一条完成且 Token 大于零的模型响应算一次；Codex 使用唯一 `response_id`，不再用 turn 数代替调用数。
-- `速`：单个可靠性能样本为 `output_tokens / ((duration_ms - ttft_ms) / 1000)`，多样本取 Token 加权平均；解码窗口小于 500ms 的异常样本不参与统计。性能样本数与调用数独立展示。
-- `首`：开始到首个内容 Token 的时间。缺少首内容时间的历史记录不参与平均，不用总耗时代替。
+- `速`：整体有效 TPS 为 `sum(output_tokens) / (sum(duration_ms - ttft_ms) / 1000)`；仅纳入输出 Token 大于零、首响和总时长有效且解码窗口不少于 500ms 的样本。小于 500ms 的异常样本不参与统计。
+- `首`：开始到首个内容 Token 的时间，按有效 `ttft_ms` 算术平均。缺少首内容时间、负数时间或时间顺序异常的记录不参与平均，不用总耗时代替。
 - `量`：`非缓存输入 + 缓存读取 + 缓存写入 + 输出`。推理 Token 不重复计数。
 - `费`：按调用日期对应的厂商官方标准文本 API 单价计算，使用整数 nano-USD 汇总。
 
-实时周期的调用、量和费取最近 10 次模型响应，速和首独立取最近 10 个可靠性能样本。其他周期按每次调用自己的发生时间转换到本机时区，以自然日、周一、月初和年初为边界。
+实时周期的调用、量和费取最近 10 次模型响应；速和首分别在各自的有效样本中取最近 10 条，两个指标的样本数独立展示。其他周期按每次调用自己的发生时间转换到本机时区，以自然日、周一、月初和年初为边界。
 
 费用是 API 等价估算，不是 Codex 订阅、第三方套餐或实际账单。内置价目首次迁入本机 SQLite 后可直接增删改查，并按生效日期保留历史版本；删除预置版本后升级不会自动恢复。缓存价格空白表示该桶未计价，显式 `0` 表示免费。未知价格不会按零处理，而是显示已知费用和计价覆盖率。当前目录的官方来源包括 [OpenAI GPT-6 Astra 模型文档](https://developers.openai.com/api/docs/models/gpt-6-astra)、[OpenAI 模型文档](https://developers.openai.com/api/docs/models/gpt-5.6-sol)、[Vercel AI Gateway Muse Spark 1.3 公告](https://vercel.com/changelog/muse-spark-1-3-now-available-on-ai-gateway)、[Muse Spark 1.2 Contributor](https://vercel.com/ai-gateway/models/muse-spark-1.2-contributor/about)、[Xiaomi MiMo V2.5](https://vercel.com/ai-gateway/models/mimo-v2.5/about)、[Tencent HY3](https://vercel.com/ai-gateway/models/hy3/about)、[Z.AI GLM-5.3 Flash](https://vercel.com/ai-gateway/models/glm-5.3-flash)、[MiniMax 按量价格](https://platform.minimax.io/docs/guides/pricing-paygo) 和 [DeepSeek 定价](https://api-docs.deepseek.com/quick_start/pricing)。
 

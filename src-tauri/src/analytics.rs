@@ -300,6 +300,18 @@ struct Observation {
     updated_at: String,
 }
 
+#[derive(Clone, Default)]
+struct PerformanceSamples {
+    ttft: Vec<Observation>,
+    tps: Vec<Observation>,
+}
+
+#[derive(Clone, Copy)]
+enum PerformanceMetric {
+    Ttft,
+    Tps,
+}
+
 pub fn migrate(conn: &Connection) -> AppResult<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS usage_observations (
@@ -568,7 +580,8 @@ fn materialize_observations(conn: &Connection) -> AppResult<()> {
         "INSERT INTO performance_observations(source_id,external_id,provider,model,reasoning_effort,occurred_at_ms,duration_ms,ttft_ms,output_tokens,updated_at)
          SELECT o.source_id,o.external_id,o.provider,o.model,o.reasoning_effort,o.completed_at_ms,o.duration_ms,o.ttft_ms,o.output_tokens,o.updated_at
          FROM usage_observations o JOIN sources s ON s.id=o.source_id
-         WHERE s.source_kind!='codex_jsonl' AND o.status='completed' AND o.completed_at_ms IS NOT NULL AND o.duration_ms IS NOT NULL",
+         WHERE s.source_kind!='codex_jsonl' AND o.status='completed' AND o.completed_at_ms IS NOT NULL
+           AND (o.duration_ms IS NOT NULL OR o.ttft_ms IS NOT NULL)",
         [],
     ).map_err(db::to_error)?;
 
@@ -627,7 +640,8 @@ fn materialize_observations(conn: &Connection) -> AppResult<()> {
                 t.model,COALESCE(NULLIF(lower(t.reasoning_effort),''),'default'),
                 CAST(strftime('%s',t.completed_at) AS INTEGER)*1000,t.duration_ms,t.ttft_ms,t.output_tokens,t.updated_at
          FROM turns t JOIN sources s ON s.id=t.source_id
-         WHERE s.source_kind='codex_jsonl' AND t.status='completed' AND t.completed_at IS NOT NULL AND t.duration_ms IS NOT NULL",
+         WHERE s.source_kind='codex_jsonl' AND t.status='completed' AND t.completed_at IS NOT NULL
+           AND (t.duration_ms IS NOT NULL OR t.ttft_ms IS NOT NULL)",
         [],
     ).map_err(db::to_error)?;
     Ok(())
@@ -2190,9 +2204,25 @@ fn load(path: &Path, filters: &AnalyticsFilters) -> AppResult<Vec<Observation>> 
     rows.collect::<Result<Vec<_>, _>>().map_err(db::to_error)
 }
 
-fn load_performance(path: &Path, filters: &AnalyticsFilters) -> AppResult<Vec<Observation>> {
+fn load_performance_metric(
+    path: &Path,
+    filters: &AnalyticsFilters,
+    metric: PerformanceMetric,
+) -> AppResult<Vec<Observation>> {
     let conn = db::open(path)?;
-    let mut sql="SELECT o.source_id,s.name,o.provider,o.model,o.reasoning_effort,o.occurred_at_ms,o.duration_ms,o.ttft_ms,o.output_tokens,o.updated_at FROM performance_observations o JOIN sources s ON s.id=o.source_id WHERE s.enabled=1".to_string();
+    let metric_filter = match metric {
+        PerformanceMetric::Ttft => {
+            " AND o.output_tokens>0 AND o.ttft_ms IS NOT NULL AND o.ttft_ms>=0
+              AND (o.duration_ms IS NULL OR o.duration_ms>=o.ttft_ms)"
+                .to_string()
+        }
+        PerformanceMetric::Tps => format!(
+            " AND o.output_tokens>0 AND o.duration_ms IS NOT NULL AND o.ttft_ms IS NOT NULL
+              AND o.duration_ms>=0 AND o.ttft_ms>=0 AND o.duration_ms>o.ttft_ms
+              AND o.duration_ms-o.ttft_ms>={MIN_DECODE_MS}"
+        ),
+    };
+    let mut sql=format!("SELECT o.source_id,s.name,o.provider,o.model,o.reasoning_effort,o.occurred_at_ms,o.duration_ms,o.ttft_ms,o.output_tokens,o.updated_at FROM performance_observations o JOIN sources s ON s.id=o.source_id WHERE s.enabled=1{metric_filter}");
     let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     if let Some(start) = period_start(filters.period) {
         sql.push_str(" AND o.occurred_at_ms>=?");
@@ -2242,6 +2272,13 @@ fn load_performance(path: &Path, filters: &AnalyticsFilters) -> AppResult<Vec<Ob
     rows.collect::<Result<Vec<_>, _>>().map_err(db::to_error)
 }
 
+fn load_performance(path: &Path, filters: &AnalyticsFilters) -> AppResult<PerformanceSamples> {
+    Ok(PerformanceSamples {
+        ttft: load_performance_metric(path, filters, PerformanceMetric::Ttft)?,
+        tps: load_performance_metric(path, filters, PerformanceMetric::Tps)?,
+    })
+}
+
 fn average(values: impl Iterator<Item = f64>) -> Option<f64> {
     let values = values.collect::<Vec<_>>();
     (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
@@ -2253,28 +2290,37 @@ const MIN_DECODE_MS: i64 = 500;
 fn decode_ms(row: &Observation) -> Option<i64> {
     let duration = row.duration_ms?;
     let ttft = row.ttft_ms?;
-    (row.tokens.output > 0 && duration > ttft && duration - ttft >= MIN_DECODE_MS)
+    (valid_ttft(row) && duration > ttft && duration - ttft >= MIN_DECODE_MS)
         .then_some(duration - ttft)
 }
 
-/// 按 Token 加权的有效速度：小分母异常样本不再以算术平均拉高整体。
-fn weighted_tps(rows: &[Observation]) -> Option<f64> {
-    let mut tokens = 0_i64;
-    let mut weighted_sum = 0.0;
+fn valid_ttft(row: &Observation) -> bool {
+    if row.tokens.output <= 0 {
+        return false;
+    }
+    let Some(ttft) = row.ttft_ms else {
+        return false;
+    };
+    ttft >= 0 && row.duration_ms.is_none_or(|duration| duration >= ttft)
+}
+
+/// 整体有效吞吐：所有可靠样本的输出 Token 总数除以解码窗口总时长。
+fn aggregate_tps(rows: &[Observation]) -> Option<f64> {
+    let mut tokens = 0.0;
+    let mut total_decode_ms = 0.0;
     for row in rows {
         if let Some(window) = decode_ms(row) {
-            tokens += row.tokens.output;
-            let output = row.tokens.output as f64;
-            weighted_sum += output * (output / (window as f64 / 1000.0));
+            tokens += row.tokens.output as f64;
+            total_decode_ms += window as f64;
         }
     }
-    (tokens > 0).then(|| weighted_sum / tokens as f64)
+    (tokens > 0.0 && total_decode_ms > 0.0).then(|| tokens / (total_decode_ms / 1000.0))
 }
 
 fn summarize(
     period: MetricPeriod,
     rows: &[Observation],
-    performance: &[Observation],
+    performance: &PerformanceSamples,
 ) -> MetricSummary {
     let mut tokens = UsageTokens::default();
     for row in rows {
@@ -2298,13 +2344,24 @@ fn summarize(
     MetricSummary {
         period,
         call_count: rows.len() as i64,
-        performance_sample_count: performance.len() as i64,
+        ttft_sample_count: performance
+            .ttft
+            .iter()
+            .filter(|row| valid_ttft(row))
+            .count() as i64,
+        tps_sample_count: performance
+            .tps
+            .iter()
+            .filter(|row| decode_ms(row).is_some())
+            .count() as i64,
         average_ttft_ms: average(
             performance
+                .ttft
                 .iter()
+                .filter(|row| valid_ttft(row))
                 .filter_map(|r| r.ttft_ms.map(|v| v as f64)),
         ),
-        average_effective_tps: weighted_tps(performance),
+        average_effective_tps: aggregate_tps(&performance.tps),
         tokens,
         estimated_cost_nano_usd: rows.iter().map(|r| r.cost).sum(),
         pricing: PricingCoverage {
@@ -2322,7 +2379,7 @@ fn summarize(
 fn model_effort_stats(
     period: MetricPeriod,
     rows: Vec<Observation>,
-    performance: &[Observation],
+    performance: &PerformanceSamples,
 ) -> Vec<ModelEffortStat> {
     let mut groups: BTreeMap<(i64, String, String, String, String), Vec<Observation>> =
         BTreeMap::new();
@@ -2342,7 +2399,8 @@ fn model_effort_stats(
         .into_iter()
         .map(
             |((source_id, source_name, provider, model, effort), rows)| {
-                let perf = performance
+                let ttft = performance
+                    .ttft
                     .iter()
                     .filter(|row| {
                         row.source_id == source_id
@@ -2352,7 +2410,18 @@ fn model_effort_stats(
                     })
                     .cloned()
                     .collect::<Vec<_>>();
-                let summary = summarize(period, &rows, &perf);
+                let tps = performance
+                    .tps
+                    .iter()
+                    .filter(|row| {
+                        row.source_id == source_id
+                            && row.provider == provider
+                            && row.model == model
+                            && row.effort == effort
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let summary = summarize(period, &rows, &PerformanceSamples { ttft, tps });
                 ModelEffortStat {
                     source_id,
                     source_name,
@@ -2360,7 +2429,8 @@ fn model_effort_stats(
                     model,
                     reasoning_effort: effort,
                     call_count: summary.call_count,
-                    performance_sample_count: summary.performance_sample_count,
+                    ttft_sample_count: summary.ttft_sample_count,
+                    tps_sample_count: summary.tps_sample_count,
                     average_ttft_ms: summary.average_ttft_ms,
                     average_effective_tps: summary.average_effective_tps,
                     tokens: summary.tokens,
@@ -2377,29 +2447,11 @@ fn model_effort_stats(
 fn metric_series(
     period: MetricPeriod,
     rows: &[Observation],
-    performance: &[Observation],
+    performance: &PerformanceSamples,
 ) -> Vec<MetricSeriesPoint> {
     let mut groups: BTreeMap<String, (String, Vec<&Observation>)> = BTreeMap::new();
     for row in rows.iter().rev() {
-        let local = Local.timestamp_millis_opt(row.completed_at).single();
-        let (bucket, label) = match (period, local) {
-            (MetricPeriod::Realtime, Some(v)) => (
-                format!("{}-{}", v.format("%H:%M:%S"), row.model),
-                v.format("%H:%M").to_string(),
-            ),
-            (MetricPeriod::Today, Some(v)) => (
-                v.format("%Y-%m-%d-%H").to_string(),
-                v.format("%H:00").to_string(),
-            ),
-            (MetricPeriod::Week | MetricPeriod::Month, Some(v)) => (
-                v.format("%Y-%m-%d").to_string(),
-                v.format("%m-%d").to_string(),
-            ),
-            (MetricPeriod::Year, Some(v)) => {
-                (v.format("%Y-%m").to_string(), v.format("%Y-%m").to_string())
-            }
-            (_, None) => (row.completed_at.to_string(), "--".into()),
-        };
+        let (bucket, label) = metric_bucket(period, row.completed_at, Some(&row.model));
         groups
             .entry(bucket)
             .or_insert_with(|| (label, Vec::new()))
@@ -2409,33 +2461,46 @@ fn metric_series(
     groups
         .into_iter()
         .map(|(bucket, (label, rows))| {
-            let perf = performance
-                .iter()
-                .filter(|row| {
-                    let local = Local.timestamp_millis_opt(row.completed_at).single();
-                    match (period, local) {
-                        (MetricPeriod::Realtime, _) => rows
-                            .iter()
-                            .any(|call| call.source_id == row.source_id && call.model == row.model),
-                        (MetricPeriod::Today, Some(v)) => {
-                            v.format("%Y-%m-%d-%H").to_string() == bucket
-                        }
-                        (MetricPeriod::Week | MetricPeriod::Month, Some(v)) => {
-                            v.format("%Y-%m-%d").to_string() == bucket
-                        }
-                        (MetricPeriod::Year, Some(v)) => v.format("%Y-%m").to_string() == bucket,
-                        _ => false,
-                    }
-                })
-                .cloned()
-                .collect::<Vec<_>>();
+            let matches_bucket = |performance_row: &Observation| {
+                if metric_bucket(
+                    period,
+                    performance_row.completed_at,
+                    Some(&performance_row.model),
+                )
+                .0 != bucket
+                {
+                    return false;
+                }
+                period != MetricPeriod::Realtime
+                    || rows.iter().any(|call| {
+                        call.source_id == performance_row.source_id
+                            && call.provider == performance_row.provider
+                            && call.model == performance_row.model
+                            && call.effort == performance_row.effort
+                    })
+            };
+            let perf = PerformanceSamples {
+                ttft: performance
+                    .ttft
+                    .iter()
+                    .filter(|row| matches_bucket(row))
+                    .cloned()
+                    .collect(),
+                tps: performance
+                    .tps
+                    .iter()
+                    .filter(|row| matches_bucket(row))
+                    .cloned()
+                    .collect(),
+            };
             let bucket_rows = rows.into_iter().cloned().collect::<Vec<_>>();
             let s = summarize(period, &bucket_rows, &perf);
             MetricSeriesPoint {
                 bucket,
                 label,
                 call_count: s.call_count,
-                performance_sample_count: s.performance_sample_count,
+                ttft_sample_count: s.ttft_sample_count,
+                tps_sample_count: s.tps_sample_count,
                 average_ttft_ms: s.average_ttft_ms,
                 average_effective_tps: s.average_effective_tps,
                 total_tokens: s.tokens.total,
@@ -2443,6 +2508,36 @@ fn metric_series(
             }
         })
         .collect()
+}
+
+fn metric_bucket(
+    period: MetricPeriod,
+    occurred_at_ms: i64,
+    model: Option<&str>,
+) -> (String, String) {
+    match (period, Local.timestamp_millis_opt(occurred_at_ms).single()) {
+        (MetricPeriod::Realtime, Some(value)) => (
+            format!(
+                "{}-{}",
+                value.format("%H:%M:%S"),
+                model.unwrap_or("unknown")
+            ),
+            value.format("%H:%M").to_string(),
+        ),
+        (MetricPeriod::Today, Some(value)) => (
+            value.format("%Y-%m-%d-%H").to_string(),
+            value.format("%H:00").to_string(),
+        ),
+        (MetricPeriod::Week | MetricPeriod::Month, Some(value)) => (
+            value.format("%Y-%m-%d").to_string(),
+            value.format("%m-%d").to_string(),
+        ),
+        (MetricPeriod::Year, Some(value)) => (
+            value.format("%Y-%m").to_string(),
+            value.format("%Y-%m").to_string(),
+        ),
+        (_, None) => (occurred_at_ms.to_string(), "--".into()),
+    }
 }
 
 pub fn query_metric_summary(path: &Path, filters: AnalyticsFilters) -> AppResult<MetricSummary> {
@@ -2612,7 +2707,7 @@ mod tests {
                 updated_at: "2026-09-06T00:00:01Z".into(),
             },
         ];
-        let summary = summarize(MetricPeriod::Today, &rows, &[]);
+        let summary = summarize(MetricPeriod::Today, &rows, &PerformanceSamples::default());
         assert_eq!(summary.estimated_cost_nano_usd, 1_000);
         assert_eq!(summary.pricing.ratio, 0.5);
         assert!(!summary.pricing.complete);
@@ -2651,7 +2746,7 @@ mod tests {
                 now - index * 1_000,
                 Some(now - index * 1_000),
                 Some(2_000),
-                Some(1_000),
+                (index >= 2).then_some(1_000),
                 "completed",
                 10,
                 0,
@@ -2674,8 +2769,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(summary.call_count, 10);
-        assert_eq!(summary.performance_sample_count, 10);
+        assert_eq!(summary.ttft_sample_count, 10);
+        assert_eq!(summary.tps_sample_count, 10);
         assert_eq!(summary.tokens.total, 200);
+        assert_eq!(summary.average_ttft_ms, Some(1_000.0));
         assert_eq!(summary.average_effective_tps, Some(10.0));
     }
 
@@ -2762,18 +2859,147 @@ mod tests {
             observation(4_120, 22_816, 22_806),
             observation(1_000, 3_000, 1_000),
         ];
-        let summary = summarize(MetricPeriod::Today, &[], &rows);
+        let summary = summarize(
+            MetricPeriod::Today,
+            &[],
+            &PerformanceSamples {
+                ttft: rows.clone(),
+                tps: rows,
+            },
+        );
         assert_eq!(summary.average_effective_tps, Some(500.0));
+        assert_eq!(summary.tps_sample_count, 1);
     }
 
     #[test]
-    fn average_tps_is_token_weighted_not_arithmetic() {
+    fn average_tps_is_aggregate_throughput_not_average_of_sample_rates() {
         let rows = vec![
             observation(100, 11_000, 1_000),
             observation(900, 31_000, 1_000),
         ];
-        let summary = summarize(MetricPeriod::Today, &[], &rows);
-        assert_eq!(summary.average_effective_tps, Some(28.0));
+        let summary = summarize(
+            MetricPeriod::Today,
+            &[],
+            &PerformanceSamples {
+                ttft: rows.clone(),
+                tps: rows,
+            },
+        );
+        assert_eq!(summary.average_effective_tps, Some(25.0));
+    }
+
+    #[test]
+    fn ttft_and_tps_have_independent_validity_rules() {
+        let rows = vec![
+            observation(100, 1_000, 500),
+            observation(100, 1_000, -100),
+            observation(0, 1_000, 200),
+            Observation {
+                duration_ms: None,
+                ttft_ms: Some(700),
+                ..observation(100, 1_000, 700)
+            },
+            observation(100, 500, 600),
+        ];
+        let summary = summarize(
+            MetricPeriod::Today,
+            &[],
+            &PerformanceSamples {
+                ttft: rows.clone(),
+                tps: rows,
+            },
+        );
+        assert_eq!(summary.ttft_sample_count, 2);
+        assert_eq!(summary.tps_sample_count, 1);
+        assert_eq!(summary.average_ttft_ms, Some(600.0));
+        assert_eq!(summary.average_effective_tps, Some(200.0));
+    }
+
+    #[test]
+    fn model_stats_keep_performance_samples_in_their_dimension_group() {
+        let mut qwen_call = observation(100, 1_000, 100);
+        let mut other_call = observation(200, 2_000, 100);
+        qwen_call.model = "qwen".into();
+        other_call.model = "other".into();
+
+        let mut qwen_performance = observation(100, 1_000, 100);
+        let mut other_performance = observation(200, 2_000, 100);
+        qwen_performance.model = "qwen".into();
+        other_performance.model = "other".into();
+
+        let stats = model_effort_stats(
+            MetricPeriod::Today,
+            vec![qwen_call, other_call],
+            &PerformanceSamples {
+                ttft: vec![qwen_performance.clone(), other_performance.clone()],
+                tps: vec![qwen_performance, other_performance],
+            },
+        );
+
+        assert_eq!(stats.len(), 2);
+        let qwen = stats.iter().find(|row| row.model == "qwen").unwrap();
+        let other = stats.iter().find(|row| row.model == "other").unwrap();
+        assert_eq!(qwen.ttft_sample_count, 1);
+        assert_eq!(qwen.tps_sample_count, 1);
+        assert!((qwen.average_effective_tps.unwrap() - 111.11111111111111).abs() < 1e-9);
+        assert_eq!(other.ttft_sample_count, 1);
+        assert_eq!(other.tps_sample_count, 1);
+        assert!((other.average_effective_tps.unwrap() - 105.26315789473684).abs() < 1e-9);
+    }
+
+    #[test]
+    fn materializes_ttft_only_observations_for_first_response_stats() {
+        let (_temp, path) = empty_meter();
+        let conn = db::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO sources(id,name,root_path,source_kind,enabled) VALUES (400,'Fixture','/fixture','fixture',1)",
+            [],
+        )
+        .unwrap();
+        let now = Utc::now().timestamp_millis();
+        upsert_observation(
+            &conn,
+            400,
+            "ttft-only",
+            "Fixture",
+            "fixture-model",
+            "default",
+            now - 700,
+            Some(now),
+            None,
+            Some(700),
+            "completed",
+            0,
+            0,
+            0,
+            100,
+            0,
+            &Utc::now().to_rfc3339(),
+        )
+        .unwrap();
+        materialize_observations(&conn).unwrap();
+        let performance_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM performance_observations WHERE source_id=400",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(performance_count, 1);
+        drop(conn);
+
+        let summary = query_metric_summary(
+            &path,
+            AnalyticsFilters {
+                period: MetricPeriod::Realtime,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(summary.ttft_sample_count, 1);
+        assert_eq!(summary.tps_sample_count, 0);
+        assert_eq!(summary.average_ttft_ms, Some(700.0));
+        assert_eq!(summary.average_effective_tps, None);
     }
 
     #[test]
