@@ -125,7 +125,7 @@ export const meterApi = {
     } catch (reason) {
       const error = errorMessage(reason)
       if (isUnavailablePlatformError(error)) return { phase: 'unavailable', currentVersion, platform, message: `没有找到适配 ${platform} 的更新包`, error, downloadedBytes: 0 }
-      throw reason
+      return { phase: 'error', currentVersion, platform, message: '更新清单或网络请求失败，请确认网络后重试', error, downloadedBytes: 0 }
     }
   },
   downloadAndInstallUpdate: async (onState: (state: AppUpdateState) => void) => {

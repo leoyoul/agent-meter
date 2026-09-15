@@ -71,30 +71,30 @@ describe('browser mock API v0.4', () => {
     expect(state.phase).toBe('unavailable')
     expect(state.platform).toBe('browser')
     expect(state.message).toContain('本地预览不支持')
-    expect(state.currentVersion).toBe('0.4.7')
+    expect(state.currentVersion).toBe('0.4.8')
   })
 
   it('reports an available update for the current Tauri target', async () => {
     Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {}, configurable: true })
     getVersionMock.mockResolvedValue('0.4.5')
     invokeMock.mockImplementation(async (command: string) => command === 'get_update_target' ? 'darwin-aarch64' : undefined)
-    checkMock.mockResolvedValue({ version: '0.4.7', body: '更新说明', close: vi.fn() })
+    checkMock.mockResolvedValue({ version: '0.4.8', body: '更新说明', close: vi.fn() })
 
     const state = await meterApi.checkForUpdate()
 
-    expect(state).toMatchObject({ phase: 'available', currentVersion: '0.4.5', platform: 'darwin-aarch64', version: '0.4.7' })
+    expect(state).toMatchObject({ phase: 'available', currentVersion: '0.4.5', platform: 'darwin-aarch64', version: '0.4.8' })
     expect(checkMock).toHaveBeenCalledWith({ timeout: 20_000 })
   })
 
   it('reports a current version only after the updater confirms no newer release', async () => {
     Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {}, configurable: true })
-    getVersionMock.mockResolvedValue('0.4.7')
+    getVersionMock.mockResolvedValue('0.4.8')
     invokeMock.mockResolvedValue('darwin-aarch64')
     checkMock.mockResolvedValue(null)
 
     const state = await meterApi.checkForUpdate()
 
-    expect(state).toMatchObject({ phase: 'current', currentVersion: '0.4.7', platform: 'darwin-aarch64' })
+    expect(state).toMatchObject({ phase: 'current', currentVersion: '0.4.8', platform: 'darwin-aarch64' })
     expect(state.message).toContain('没有高于当前版本')
   })
 
@@ -109,7 +109,7 @@ describe('browser mock API v0.4', () => {
     expect(unavailable.message).toContain('没有找到适配')
 
     checkMock.mockRejectedValueOnce(new Error('network timeout'))
-    await expect(meterApi.checkForUpdate()).rejects.toThrow('network timeout')
+    await expect(meterApi.checkForUpdate()).resolves.toMatchObject({ phase: 'error', platform: 'darwin-aarch64', currentVersion: '0.4.5', error: 'network timeout' })
   })
 
   it('supports pricing CRUD and data integrity status', async () => {
